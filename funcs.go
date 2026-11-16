@@ -18,7 +18,7 @@ var (
 	errNonSingularValue = errors.New("must read or write exactly one value")
 )
 
-type marshalFn func(e *encodeState, from reflect.Type, p unsafe.Pointer) error
+type marshalFn func(e *encodeState, b []byte, from reflect.Type, p unsafe.Pointer) ([]byte, error)
 
 type unmarshalFn func(d *decodeState, from reflect.Type, p unsafe.Pointer) error
 
@@ -63,17 +63,16 @@ func JoinUnmarshalers(us ...*Unmarshalers) *Unmarshalers {
 func MarshalFunc[T any](fn func(T) ([]byte, error)) *Marshalers {
 	t := reflect.TypeFor[T]()
 	assertCastableTo(t, true)
-	marshal := func(e *encodeState, from reflect.Type, p unsafe.Pointer) error {
-		b, err := fn(castTo(from, p, t).(T))
+	marshal := func(_ *encodeState, b []byte, from reflect.Type, p unsafe.Pointer) ([]byte, error) {
+		out, err := fn(castTo(from, p, t).(T))
 		if err != nil {
-			return funcError(t, notSkippable(err, "marshal function of type func(T) ([]byte, error)"))
+			return b, funcError(t, notSkippable(err, "marshal function of type func(T) ([]byte, error)"))
 		}
-		v := jsontext.Value(b)
+		v := jsontext.Value(out)
 		if err := v.Compact(); err != nil {
-			return funcError(t, err)
+			return b, funcError(t, err)
 		}
-		e.buf = append(e.buf, v...)
-		return nil
+		return append(b, v...), nil
 	}
 	return &Marshalers{fns: []typedFunc[marshalFn]{{typ: t, fn: marshal}}}
 }
@@ -81,24 +80,24 @@ func MarshalFunc[T any](fn func(T) ([]byte, error)) *Marshalers {
 func MarshalToFunc[T any](fn func(*jsontext.Encoder, T) error) *Marshalers {
 	t := reflect.TypeFor[T]()
 	assertCastableTo(t, true)
-	marshal := func(e *encodeState, from reflect.Type, p unsafe.Pointer) error {
-		start := len(e.buf)
-		enc := jsontext.WrapBuffer(e.buf)
+	marshal := func(_ *encodeState, b []byte, from reflect.Type, p unsafe.Pointer) ([]byte, error) {
+		start := len(b)
+		enc := jsontext.WrapBuffer(b)
 		err := fn(enc, castTo(from, p, t).(T))
-		e.buf = enc.Bytes()
+		b = enc.Bytes()
 		jsontext.PutEncoder(enc)
 		switch {
-		case err == SkipFunc && len(e.buf) == start:
-			return SkipFunc
+		case err == SkipFunc && len(b) == start:
+			return b, SkipFunc
 		case err == SkipFunc:
 			err = errSkipMutation
-		case err == nil && !scan.Valid(e.buf[start:]):
+		case err == nil && !scan.Valid(b[start:]):
 			err = errNonSingularValue
 		}
 		if err != nil {
-			return funcError(t, err)
+			return b, funcError(t, err)
 		}
-		return nil
+		return b, nil
 	}
 	return &Marshalers{fns: []typedFunc[marshalFn]{{typ: t, fn: marshal, maySkip: true}}}
 }
@@ -241,13 +240,15 @@ func applicableFuncs[F any](fns []typedFunc[F], t reflect.Type) []typedFunc[F] {
 }
 
 func customEncodeFunc(t reflect.Type, fns []typedFunc[marshalFn], fallback encodeFunc) encodeFunc {
-	return func(e *encodeState, p unsafe.Pointer) error {
+	return func(e *encodeState, b []byte, p unsafe.Pointer) ([]byte, error) {
 		for i := range fns {
-			if err := fns[i].fn(e, t, p); err != SkipFunc {
-				return err
+			out, err := fns[i].fn(e, b, t, p)
+			if err != SkipFunc {
+				return out, err
 			}
+			b = out
 		}
-		return fallback(e, p)
+		return fallback(e, b, p)
 	}
 }
 

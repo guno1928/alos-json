@@ -93,16 +93,17 @@ func StringEnd(b []byte, i int) (end int, escaped bool, ok bool) {
 			return i, escaped, true
 		case '\\':
 			escaped = true
+			if i+BlockLen <= len(b) {
+				if end, done, ok := escapedStringEnd(b, &i); done {
+					return end, true, ok
+				}
+				continue
+			}
 			n := escapeLen(b, i)
 			if n == 0 {
 				return i, escaped, false
 			}
 			i += n
-			if i+BlockLen <= len(b) {
-				if end, done, ok := escapedStringEnd(b, &i); done {
-					return end, true, ok
-				}
-			}
 		default:
 			return i, escaped, false
 		}

@@ -79,13 +79,24 @@ func TestFastAppendFloatMatchesEncodingJSON(t *testing.T) {
 	}
 }
 
-func TestWriteDigitsMatchesStrconv(t *testing.T) {
-	for _, v := range integerEdgeCases() {
-		want := strconv.FormatUint(v, 10)
-		out := make([]byte, len(want))
-		writeDigits(out, v)
-		if string(out) != want {
-			t.Fatalf("writeDigits(%d) = %q, want %q", v, out, want)
+const floatRandomSamples = 10_000_000
+
+func TestFastAppendFloatRandomMatchesEncodingJSON(t *testing.T) {
+	x := uint64(0x3243F6A8885A308D)
+	for i := range floatRandomSamples {
+		x ^= x >> 12
+		x ^= x << 25
+		x ^= x >> 27
+		r := x * 2685821657736338717
+		switch i % 4 {
+		case 0:
+			checkFastAppendFloat(t, math.Float64frombits(r), 64)
+		case 1:
+			checkFastAppendFloat(t, float64(int64(r%2_000_000_000))/1e6-1000, 64)
+		case 2:
+			checkFastAppendFloat(t, -73.0+float64(r%997)*0.0123456789+float64(r%13)/1e7, 64)
+		default:
+			checkFastAppendFloat(t, float64(math.Float32frombits(uint32(r))), 32)
 		}
 	}
 }

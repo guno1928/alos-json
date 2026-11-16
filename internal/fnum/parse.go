@@ -1,6 +1,7 @@
 package fnum
 
 import (
+	"encoding/binary"
 	"math"
 	"math/bits"
 )
@@ -33,6 +34,10 @@ const (
 	quadCombineMul   = 1 + 10_000<<32
 	swarDigitWidth   = 8
 	eightDigitsScale = 100_000_000
+	asciiLowerBit    = 0x20
+	byteBits         = 8
+	scanWindow       = 32
+	fastFractionMask = 15
 )
 
 func load8(s string, i int) uint64 {
@@ -41,12 +46,19 @@ func load8(s string, i int) uint64 {
 		uint64(s[i+4])<<32 | uint64(s[i+5])<<40 | uint64(s[i+6])<<48 | uint64(s[i+7])<<56
 }
 
+func nonDigitBytes(v uint64) uint64 {
+	return ((v + digitOverflow8) | (v - asciiZeros8)) & byteHighBits8
+}
+
 func isEightDigits(v uint64) bool {
-	return ((v+digitOverflow8)|(v-asciiZeros8))&byteHighBits8 == 0
+	return nonDigitBytes(v) == 0
 }
 
 func parseEightDigits(v uint64) uint64 {
-	v -= asciiZeros8
+	return combineEightDigits(v - asciiZeros8)
+}
+
+func combineEightDigits(v uint64) uint64 {
 	v = v*10 + v>>8
 	return (v&evenByteMask8*pairCombineMul + (v>>16)&evenByteMask8*quadCombineMul) >> 32
 }
@@ -98,6 +110,10 @@ func ParseFloat64(s string) (float64, bool) {
 		}
 		exp10 += e
 	}
+	return decimalToFloat64(mant, exp10, neg)
+}
+
+func decimalToFloat64(mant uint64, exp10 int, neg bool) (float64, bool) {
 	if mant <= maxExactMantissa && exp10 >= -maxExactPow10 && exp10 <= maxExactPow10 {
 		f := float64(mant)
 		if exp10 > 0 {
@@ -111,6 +127,143 @@ func ParseFloat64(s string) (float64, bool) {
 		return f, true
 	}
 	return eiselLemire64(mant, exp10, neg)
+}
+
+func ScanFloat64(b []byte, i int) (float64, int, bool) {
+	if i < 0 || len(b)-i < scanWindow {
+		return scanFloat64Slow(b, i)
+	}
+	w := (*[scanWindow]byte)(b[i : i+scanWindow])
+	neg := w[0] == '-'
+	o := 0
+	if neg {
+		o = 1
+	}
+	v := binary.LittleEndian.Uint64(w[o:])
+	k := uint(bits.TrailingZeros64(nonDigitBytes(v))) / byteBits
+	if k-1 >= swarDigitWidth-1 || k > 1 && byte(v) == '0' {
+		return scanFloat64Slow(b, i)
+	}
+	mant := partialDigits(v, k)
+	pos := uint(o) + k
+	exp10 := 0
+	c := w[pos]
+	if c == '.' {
+		f := binary.LittleEndian.Uint64(w[pos+1:])
+		if nd := nonDigitBytes(f); nd != 0 {
+			fk := uint(bits.TrailingZeros64(nd)) / byteBits
+			if fk == 0 {
+				return scanFloat64Slow(b, i)
+			}
+			mant = mant*pow10Uint64[fk] + partialDigits(f, fk)
+			pos += 1 + fk
+			exp10 = -int(fk)
+		} else {
+			g := binary.LittleEndian.Uint64(w[pos+1+swarDigitWidth:])
+			gk := uint(bits.TrailingZeros64(nonDigitBytes(g))) / byteBits
+			if gk == swarDigitWidth || k+swarDigitWidth+gk > maxMantissaDigits {
+				return scanFloat64Slow(b, i)
+			}
+			mant = (mant*eightDigitsScale+combineEightDigits(f-asciiZeros8))*pow10Uint64[gk] + partialDigits(g, gk)
+			pos += 1 + swarDigitWidth + gk
+			exp10 = -int(swarDigitWidth + gk)
+		}
+		c = w[pos]
+	}
+	if c|asciiLowerBit == 'e' {
+		return scanFloat64Slow(b, i)
+	}
+	if mant > maxExactMantissa {
+		f, ok := eiselLemire64(mant, exp10, neg)
+		return f, i + int(pos), ok
+	}
+	f := float64(int64(mant)) / exactPow10[uint(-exp10)&fastFractionMask]
+	if neg {
+		f = -f
+	}
+	return f, i + int(pos), true
+}
+
+func partialDigits(v uint64, k uint) uint64 {
+	return combineEightDigits((v - asciiZeros8) << (byteBits * (swarDigitWidth - k)))
+}
+
+func scanFloat64Slow(b []byte, i int) (float64, int, bool) {
+	neg := i < len(b) && b[i] == '-'
+	if neg {
+		i++
+	}
+	if i >= len(b) {
+		return 0, i, false
+	}
+	start := i
+	var mant uint64
+	if b[i] == '0' {
+		i++
+	} else if mant, i = accumulateDigits(b, i, 0); i == start {
+		return 0, i, false
+	}
+	digits := i - start
+	exp10 := 0
+	if i < len(b) && b[i] == '.' {
+		i++
+		fracStart := i
+		if mant, i = accumulateDigits(b, i, mant); i == fracStart {
+			return 0, i, false
+		}
+		exp10 = fracStart - i
+		digits -= exp10
+	}
+	if digits > maxMantissaDigits {
+		return 0, i, false
+	}
+	if i < len(b) && b[i]|asciiLowerBit == 'e' {
+		e, end, ok := scanExponent(b, i+1)
+		if !ok {
+			return 0, end, false
+		}
+		exp10 += e
+		i = end
+	}
+	f, ok := decimalToFloat64(mant, exp10, neg)
+	return f, i, ok
+}
+
+func accumulateDigits(b []byte, i int, mant uint64) (uint64, int) {
+	for i+swarDigitWidth <= len(b) {
+		v := binary.LittleEndian.Uint64(b[i:])
+		if nonDigits := nonDigitBytes(v); nonDigits != 0 {
+			n := uint(bits.TrailingZeros64(nonDigits)) / byteBits
+			partial := (v - asciiZeros8) << (byteBits * (swarDigitWidth - n))
+			return mant*pow10Uint64[n] + combineEightDigits(partial), i + int(n)
+		}
+		mant = mant*eightDigitsScale + combineEightDigits(v-asciiZeros8)
+		i += swarDigitWidth
+	}
+	for ; i < len(b) && b[i]-'0' < 10; i++ {
+		mant = mant*10 + uint64(b[i]-'0')
+	}
+	return mant, i
+}
+
+func scanExponent(b []byte, i int) (int, int, bool) {
+	neg := false
+	if i < len(b) && (b[i] == '+' || b[i] == '-') {
+		neg = b[i] == '-'
+		i++
+	}
+	start := i
+	e := 0
+	for ; i < len(b) && b[i]-'0' < 10; i++ {
+		e = e*10 + int(b[i]-'0')
+	}
+	if i == start || i-start > maxExponentDigits {
+		return 0, i, false
+	}
+	if neg {
+		e = -e
+	}
+	return e, i, true
 }
 
 func significantMantissa(s string) (mant uint64, exp10 int, ok bool) {

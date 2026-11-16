@@ -13,17 +13,17 @@ Requires Go 1.24 or newer. The package name is `json`.
 
 ## At a glance
 
-Geometric mean over the datasets in [`bench/`](bench), measured on an AMD Ryzen 7 5700X with Go 1.26.2. Each number is how many times longer the other library takes than alos, so **above 1.00 means alos is faster** and below 1.00 means the other library is faster.
+Geometric mean over the datasets in [`bench/`](bench), measured on an Intel Xeon E3-1270 v6 with Go 1.26.11 on Linux. Each number is how many times longer the other library takes than alos, so **above 1.00 means alos is faster** and below 1.00 means the other library is faster.
 
 | Operation | encoding/json | json/v2 | sonic | sonic (std) | goccy | jsoniter | segmentio | alos fastest on |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| Unmarshal into structs | 8.59 | 3.48 | 1.07 | 1.38 | 1.11 | 2.35 | 1.82 | 6 / 13 |
-| Marshal structs | 2.42 | 3.13 | 0.79 | 0.99 | 0.91 | 2.24 | 1.47 | 1 / 13 |
-| Unmarshal into `any` | 3.15 | 2.37 | 1.09 | 1.30 | 1.17 | 2.54 | 3.53 | 4 / 7 |
-| Marshal `any` | 3.69 | 2.48 | 1.26 | 1.54 | 1.35 | 2.33 | 2.19 | 5 / 7 |
-| Valid | 9.20 | 3.86 | 1.34 | 1.33 | 1.77 | 6.40 | 2.35 | 10 / 13 |
+| Unmarshal into structs | 5.22 | 4.12 | 1.44 | 1.80 | 1.45 | 2.80 | 2.08 | 13 / 13 |
+| Marshal structs | 4.22 | 4.20 | 1.24 | 1.55 | 1.36 | 3.20 | 2.22 | 12 / 13 |
+| Unmarshal into `any` | 5.55 | 2.83 | 1.32 | 1.56 | 1.40 | 3.11 | 3.75 | 7 / 7 |
+| Marshal `any` | 3.82 | 3.09 | 1.65 | 1.99 | 1.72 | 3.02 | 2.88 | 7 / 7 |
+| Valid | 3.43 | 4.24 | 1.90 | 1.90 | 1.87 | 6.07 | 2.07 | 10 / 13 |
 
-alos is the fastest overall at validating, decoding and encoding `any`, and at decoding structs. sonic and goccy are faster at encoding structs. Full tables are in [Benchmarks](#benchmarks).
+alos is faster than every other library on the geometric mean of all five operations, and is the fastest on 49 of the 53 rows. sonic is 0.3% faster at encoding `twitter_100`. Of the Valid rows, goccy is faster on `large_100` and `tree_3280` (by 1.9% and 0.8%) and sonic on `escaped_strings`. sonic's Valid does not check escape sequences or control characters inside strings, so it accepts some input that `encoding/json` and alos reject. Full tables are in [Benchmarks](#benchmarks).
 
 ## Quick start
 
@@ -200,11 +200,10 @@ Behaviour that is the same:
 
 ### How they were measured
 
-- **Machine:** AMD Ryzen 7 5700X, Windows 11, Go 1.26.2, amd64 with AVX2.
-- **Runs:** each benchmark ran for 150 ms; the tables show the best of 3 runs, or 6 runs for Valid.
+- **Machine:** Intel Xeon E3-1270 v6 @ 3.80GHz (4 cores, 8 threads), Linux, Go 1.26.11 in the `golang:1.26` Docker image, amd64 with AVX2.
+- **Runs:** each benchmark ran for 150 ms, 6 times; the tables show the median.
 - **json/v2:** measured with `GOEXPERIMENT=jsonv2`.
 - **Library versions:** sonic v1.15.5 (`sonic` is the default config, `sonic (std)` is `sonic.ConfigStd`), goccy/go-json v0.12.0, json-iterator/go v1.1.12, segmentio/encoding v0.5.4.
-- **Recency:** the Valid table comes from a later run on the same machine than the other tables. The Marshal tables were measured before a final change that makes float formatting match `encoding/json`; an A/B of that change on another machine measured 1–2% on float-heavy Marshal rows.
 
 The fastest result in each row is in bold.
 
@@ -235,79 +234,79 @@ The second command includes json/v2.
 
 | dataset | alos | encoding/json | json/v2 | sonic | sonic (std) | goccy | jsoniter | segmentio |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| small | 170 ns | 926 ns | 460 ns | 196 ns | 239 ns | **138 ns** | 220 ns | 314 ns |
-| medium | 411 ns | 2.8 µs | 1.2 µs | 507 ns | 664 ns | **411 ns** | 647 ns | 732 ns |
-| large_100 | 41.4 µs | 258 µs | 126 µs | 48.2 µs | 61.3 µs | **39.8 µs** | 61.1 µs | 58.4 µs |
-| xlarge_10k | **4.07 ms** | 26.33 ms | 12.91 ms | 4.66 ms | 6.01 ms | 4.21 ms | 6.71 ms | 5.68 ms |
-| short_strings | 35.7 µs | 250 µs | 107 µs | **26.7 µs** | 48.7 µs | 49.7 µs | 67.2 µs | 56.2 µs |
-| long_string_64k | **7.2 µs** | 264 µs | 38.1 µs | 7.5 µs | 14.4 µs | 8.6 µs | 48.7 µs | 8.6 µs |
-| long_string_1m | 117 µs | 4.26 ms | 569 µs | **117 µs** | 216 µs | 152 µs | 757 µs | 135 µs |
-| escaped_strings | 79.2 µs | 469 µs | 289 µs | **58.1 µs** | 64.7 µs | 118 µs | 277 µs | 356 µs |
-| ints_10k | **115 µs** | 1.05 ms | 366 µs | 132 µs | 130 µs | 129 µs | 215 µs | 135 µs |
-| floats_10k | 215 µs | 1.60 ms | 860 µs | 234 µs | 230 µs | **185 µs** | 1.14 ms | 547 µs |
-| twitter_100 | **165 µs** | 1.02 ms | 485 µs | 197 µs | 228 µs | 202 µs | 365 µs | 591 µs |
-| tree_3280 | **400 µs** | 2.75 ms | 1.62 ms | 526 µs | 572 µs | 454 µs | 621 µs | 677 µs |
-| deep_chain_200 | **27.0 µs** | 159 µs | 89.6 µs | 32.3 µs | 34.8 µs | 31.5 µs | 37.8 µs | 55.3 µs |
+| small | **211 ns** | 761 ns | 611 ns | 312 ns | 380 ns | 223 ns | 314 ns | 294 ns |
+| medium | **500 ns** | 2.2 µs | 1.8 µs | 820 ns | 1.0 µs | 648 ns | 955 ns | 855 ns |
+| large_100 | **46.8 µs** | 213 µs | 188 µs | 78.1 µs | 92.5 µs | 62.2 µs | 90.5 µs | 85.8 µs |
+| xlarge_10k | **4.94 ms** | 21.76 ms | 19.32 ms | 8.03 ms | 9.92 ms | 6.72 ms | 10.25 ms | 8.42 ms |
+| short_strings | **36.0 µs** | 194 µs | 171 µs | 41.0 µs | 74.1 µs | 70.7 µs | 91.0 µs | 78.8 µs |
+| long_string_64k | **10.9 µs** | 76.2 µs | 42.8 µs | 11.1 µs | 21.5 µs | 12.8 µs | 58.9 µs | 12.5 µs |
+| long_string_1m | **147 µs** | 1.18 ms | 632 µs | 189 µs | 333 µs | 217 µs | 894 µs | 182 µs |
+| escaped_strings | **77.0 µs** | 535 µs | 408 µs | 85.1 µs | 91.0 µs | 184 µs | 398 µs | 475 µs |
+| ints_10k | **162 µs** | 665 µs | 512 µs | 197 µs | 196 µs | 186 µs | 298 µs | 198 µs |
+| floats_10k | **204 µs** | 1.46 ms | 1.24 ms | 370 µs | 368 µs | 266 µs | 1.71 ms | 798 µs |
+| twitter_100 | **222 µs** | 832 µs | 702 µs | 282 µs | 305 µs | 312 µs | 508 µs | 623 µs |
+| tree_3280 | **464 µs** | 2.53 ms | 2.21 ms | 887 µs | 952 µs | 722 µs | 936 µs | 1.03 ms |
+| deep_chain_200 | **25.7 µs** | 138 µs | 123 µs | 49.1 µs | 54.4 µs | 47.1 µs | 47.8 µs | 80.6 µs |
 
 ### Marshal structs
 
 | dataset | alos | encoding/json | json/v2 | sonic | sonic (std) | goccy | jsoniter | segmentio |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| small | **102 ns** | 228 ns | 307 ns | 114 ns | 183 ns | 108 ns | 209 ns | 134 ns |
-| medium | 229 ns | 493 ns | 700 ns | 210 ns | 295 ns | **196 ns** | 426 ns | 271 ns |
-| large_100 | 19.5 µs | 40.9 µs | 61.8 µs | **14.9 µs** | 16.0 µs | 16.1 µs | 38.6 µs | 23.7 µs |
-| xlarge_10k | 1.94 ms | 4.11 ms | 6.27 ms | 2.35 ms | 2.97 ms | **1.49 ms** | 3.89 ms | 2.46 ms |
-| short_strings | 24.9 µs | 41.2 µs | 47.3 µs | 16.8 µs | 17.3 µs | **16.6 µs** | 29.2 µs | 22.4 µs |
-| long_string_64k | 12.0 µs | 53.9 µs | 81.1 µs | **10.6 µs** | 12.9 µs | 13.4 µs | 75.5 µs | 23.4 µs |
-| long_string_1m | 140 µs | 856 µs | 1.28 ms | **112 µs** | 262 µs | 172 µs | 1.17 ms | 408 µs |
-| escaped_strings | 50.1 µs | 109 µs | 113 µs | **29.4 µs** | 46.2 µs | 42.8 µs | 116 µs | 132 µs |
-| ints_10k | 91.0 µs | 177 µs | 164 µs | **57.6 µs** | 62.5 µs | 99.3 µs | 98.8 µs | 93.3 µs |
-| floats_10k | 401 µs | 582 µs | 580 µs | **280 µs** | 285 µs | 383 µs | 531 µs | 520 µs |
-| twitter_100 | 84.3 µs | 180 µs | 256 µs | **67.3 µs** | 73.9 µs | 70.4 µs | 188 µs | 113 µs |
-| tree_3280 | 204 µs | 559 µs | 778 µs | **157 µs** | 165 µs | 221 µs | 484 µs | 303 µs |
-| deep_chain_200 | 13.4 µs | 37.3 µs | 49.1 µs | **8.6 µs** | 8.8 µs | 9.8 µs | 28.9 µs | 22.9 µs |
+| small | **125 ns** | 425 ns | 426 ns | 182 ns | 255 ns | 150 ns | 303 ns | 198 ns |
+| medium | **242 ns** | 920 ns | 928 ns | 314 ns | 417 ns | 267 ns | 587 ns | 385 ns |
+| large_100 | **18.2 µs** | 81.7 µs | 82.5 µs | 21.4 µs | 22.6 µs | 21.6 µs | 50.4 µs | 30.9 µs |
+| xlarge_10k | **1.98 ms** | 8.50 ms | 8.56 ms | 3.48 ms | 3.90 ms | 2.11 ms | 5.13 ms | 3.33 ms |
+| short_strings | **20.2 µs** | 62.4 µs | 62.3 µs | 24.5 µs | 25.7 µs | 24.9 µs | 32.1 µs | 32.3 µs |
+| long_string_64k | **10.6 µs** | 57.6 µs | 57.9 µs | 12.6 µs | 17.4 µs | 12.0 µs | 96.3 µs | 32.0 µs |
+| long_string_1m | **141 µs** | 910 µs | 903 µs | 168 µs | 424 µs | 218 µs | 1.49 ms | 561 µs |
+| escaped_strings | **35.0 µs** | 137 µs | 126 µs | 39.0 µs | 60.9 µs | 56.8 µs | 138 µs | 156 µs |
+| ints_10k | **53.2 µs** | 224 µs | 224 µs | 88.5 µs | 94.8 µs | 135 µs | 131 µs | 135 µs |
+| floats_10k | **317 µs** | 861 µs | 874 µs | 378 µs | 390 µs | 524 µs | 731 µs | 725 µs |
+| twitter_100 | 89.6 µs | 357 µs | 344 µs | **89.3 µs** | 100.0 µs | 98.3 µs | 234 µs | 152 µs |
+| tree_3280 | **205 µs** | 991 µs | 1.00 ms | 225 µs | 235 µs | 316 µs | 609 µs | 434 µs |
+| deep_chain_200 | **10.1 µs** | 58.1 µs | 59.0 µs | 10.9 µs | 11.6 µs | 13.0 µs | 34.0 µs | 25.2 µs |
 
 ### Unmarshal into `any`
 
 | dataset | alos | encoding/json | json/v2 | sonic | sonic (std) | goccy | jsoniter | segmentio |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| small | **341 ns** | 865 ns | 709 ns | 376 ns | 475 ns | 377 ns | 557 ns | 685 ns |
-| medium | **837 ns** | 2.3 µs | 1.7 µs | 998 ns | 1.3 µs | 1.0 µs | 1.8 µs | 1.8 µs |
-| large_100 | **79.7 µs** | 212 µs | 166 µs | 90.9 µs | 119 µs | 103 µs | 181 µs | 207 µs |
-| escaped_strings | 80.1 µs | 446 µs | 294 µs | **63.1 µs** | 67.2 µs | 128 µs | 324 µs | 627 µs |
-| floats_10k | 286 µs | 1.49 ms | 1.05 ms | 401 µs | 406 µs | **278 µs** | 1.81 ms | 1.15 ms |
-| twitter_100 | 442 µs | 1.08 ms | 780 µs | 445 µs | 552 µs | **437 µs** | 791 µs | 1.93 ms |
-| tree_3280 | **1.00 ms** | 2.37 ms | 1.99 ms | 1.11 ms | 1.31 ms | 1.08 ms | 1.90 ms | 4.43 ms |
+| small | **456 ns** | 2.0 µs | 988 ns | 559 ns | 703 ns | 551 ns | 819 ns | 834 ns |
+| medium | **1.1 µs** | 5.8 µs | 2.6 µs | 1.5 µs | 1.9 µs | 1.6 µs | 2.8 µs | 2.5 µs |
+| large_100 | **107 µs** | 572 µs | 258 µs | 135 µs | 180 µs | 150 µs | 283 µs | 294 µs |
+| escaped_strings | **78.5 µs** | 623 µs | 418 µs | 89.4 µs | 94.2 µs | 206 µs | 455 µs | 802 µs |
+| floats_10k | **288 µs** | 2.72 ms | 1.47 ms | 592 µs | 597 µs | 384 µs | 2.59 ms | 1.71 ms |
+| twitter_100 | **561 µs** | 2.11 ms | 1.09 ms | 613 µs | 745 µs | 581 µs | 1.14 ms | 1.71 ms |
+| tree_3280 | **1.29 ms** | 6.22 ms | 2.93 ms | 1.71 ms | 1.99 ms | 1.56 ms | 2.89 ms | 6.56 ms |
 
 ### Marshal `any`
 
 | dataset | alos | encoding/json | json/v2 | sonic | sonic (std) | goccy | jsoniter | segmentio |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| small | **172 ns** | 691 ns | 1.0 µs | 296 ns | 390 ns | 255 ns | 419 ns | 343 ns |
-| medium | **404 ns** | 2.0 µs | 2.0 µs | 646 ns | 876 ns | 653 ns | 976 ns | 968 ns |
-| large_100 | **39.4 µs** | 205 µs | 74.3 µs | 60.7 µs | 70.4 µs | 61.9 µs | 97.6 µs | 95.3 µs |
-| escaped_strings | 52.9 µs | 125 µs | 112 µs | **33.2 µs** | 48.6 µs | 45.9 µs | 129 µs | 138 µs |
-| floats_10k | 425 µs | 800 µs | 605 µs | **358 µs** | 362 µs | 414 µs | 689 µs | 637 µs |
-| twitter_100 | **181 µs** | 795 µs | 332 µs | 244 µs | 298 µs | 271 µs | 426 µs | 429 µs |
-| tree_3280 | **484 µs** | 2.23 ms | 940 µs | 796 µs | 878 µs | 845 µs | 1.32 ms | 1.09 ms |
+| small | **233 ns** | 1.6 µs | 1.4 µs | 437 ns | 554 ns | 375 ns | 627 ns | 531 ns |
+| medium | **520 ns** | 3.4 µs | 2.6 µs | 988 ns | 1.2 µs | 891 ns | 1.4 µs | 1.5 µs |
+| large_100 | **46.7 µs** | 146 µs | 106 µs | 90.1 µs | 104 µs | 85.1 µs | 140 µs | 146 µs |
+| escaped_strings | **34.7 µs** | 138 µs | 125 µs | 42.2 µs | 64.1 µs | 60.1 µs | 150 µs | 163 µs |
+| floats_10k | **350 µs** | 897 µs | 893 µs | 473 µs | 487 µs | 560 µs | 965 µs | 881 µs |
+| twitter_100 | **215 µs** | 650 µs | 452 µs | 359 µs | 418 µs | 372 µs | 612 µs | 609 µs |
+| tree_3280 | **628 µs** | 1.73 ms | 1.31 ms | 1.10 ms | 1.26 ms | 1.14 ms | 1.92 ms | 1.52 ms |
 
 ### Valid
 
 | dataset | alos | encoding/json | json/v2 | sonic | sonic (std) | goccy | jsoniter | segmentio |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| small | **39 ns** | 198 ns | 167 ns | 75 ns | 73 ns | 58 ns | 172 ns | 186 ns |
-| medium | **119 ns** | 578 ns | 369 ns | 181 ns | 180 ns | 127 ns | 477 ns | 299 ns |
-| large_100 | **11.7 µs** | 55.3 µs | 32.0 µs | 17.3 µs | 17.1 µs | 11.8 µs | 46.8 µs | 19.5 µs |
-| xlarge_10k | **1.25 ms** | 6.11 ms | 3.19 ms | 1.75 ms | 1.80 ms | 1.25 ms | 5.13 ms | 2.00 ms |
-| short_strings | 9.9 µs | 58.3 µs | 17.6 µs | 12.4 µs | 12.5 µs | **9.4 µs** | 29.0 µs | 17.3 µs |
-| long_string_64k | **1.1 µs** | 181 µs | 29.0 µs | 1.5 µs | 1.5 µs | 14.2 µs | 38.2 µs | 2.2 µs |
-| long_string_1m | **19.0 µs** | 2.75 ms | 451 µs | 24.1 µs | 23.6 µs | 258 µs | 632 µs | 36.2 µs |
-| escaped_strings | 21.4 µs | 247 µs | 90.5 µs | 7.4 µs | **7.3 µs** | 56.0 µs | 359 µs | 87.3 µs |
-| ints_10k | **52.4 µs** | 265 µs | 98.9 µs | 104 µs | 106 µs | 65.6 µs | 203 µs | 117 µs |
-| floats_10k | **71.5 µs** | 460 µs | 161 µs | 115 µs | 112 µs | 128 µs | 274 µs | 163 µs |
-| twitter_100 | **47.4 µs** | 313 µs | 144 µs | 60.8 µs | 61.2 µs | 50.5 µs | 269 µs | 243 µs |
-| tree_3280 | 133 µs | 611 µs | 366 µs | 205 µs | 204 µs | **122 µs** | 583 µs | 216 µs |
-| deep_chain_200 | **7.6 µs** | 29.2 µs | 21.9 µs | 11.9 µs | 11.8 µs | 9.0 µs | 39.4 µs | 14.6 µs |
+| small | **51 ns** | 177 ns | 246 ns | 134 ns | 134 ns | 80 ns | 239 ns | 89 ns |
+| medium | **147 ns** | 390 ns | 558 ns | 382 ns | 383 ns | 175 ns | 639 ns | 248 ns |
+| large_100 | 15.1 µs | 31.3 µs | 47.1 µs | 34.8 µs | 34.9 µs | **14.8 µs** | 61.5 µs | 24.1 µs |
+| xlarge_10k | **1.55 ms** | 3.05 ms | 4.71 ms | 3.49 ms | 3.47 ms | 1.59 ms | 6.16 ms | 2.48 ms |
+| short_strings | **12.1 µs** | 26.0 µs | 25.9 µs | 22.9 µs | 22.9 µs | 12.3 µs | 40.1 µs | 21.1 µs |
+| long_string_64k | **2.0 µs** | 33.0 µs | 33.1 µs | 2.1 µs | 2.2 µs | 21.8 µs | 49.6 µs | 4.2 µs |
+| long_string_1m | **34.5 µs** | 526 µs | 527 µs | 37.0 µs | 37.0 µs | 399 µs | 793 µs | 76.9 µs |
+| escaped_strings | 19.3 µs | 126 µs | 127 µs | 9.7 µs | **9.7 µs** | 77.3 µs | 418 µs | 98.8 µs |
+| ints_10k | **60.8 µs** | 153 µs | 153 µs | 214 µs | 214 µs | 81.6 µs | 202 µs | 137 µs |
+| floats_10k | **84.5 µs** | 223 µs | 222 µs | 195 µs | 195 µs | 179 µs | 276 µs | 203 µs |
+| twitter_100 | **57.5 µs** | 138 µs | 205 µs | 117 µs | 117 µs | 64.4 µs | 313 µs | 149 µs |
+| tree_3280 | 162 µs | 365 µs | 535 µs | 386 µs | 387 µs | **160 µs** | 705 µs | 288 µs |
+| deep_chain_200 | **9.1 µs** | 17.3 µs | 26.8 µs | 24.4 µs | 24.4 µs | 10.0 µs | 39.5 µs | 14.6 µs |
 
 ### Allocations
 

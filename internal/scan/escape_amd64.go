@@ -2,73 +2,36 @@
 
 package scan
 
-import "math/bits"
+import "golang.org/x/sys/cpu"
 
-const (
-	evenBits       = 0x5555555555555555
-	unicodeHexRun  = 4
-	unicodeCarryAt = BlockLen - unicodeHexRun
-)
+var hasBMI = cpu.X86.HasBMI1 && cpu.X86.HasBMI2
 
-type escapeBlock struct {
-	quote     uint64
-	bslash    uint64
-	ctrl      uint64
-	notSimple uint64
-	notU      uint64
-	notHex    uint64
-}
+func useEscapeKernel() bool { return useAVX2 && hasBMI }
 
 //go:noescape
-func escapeMasksAVX2(p *byte, out *escapeBlock)
-
-func escapedMask(backslash uint64, prevEscaped *uint64) uint64 {
-	backslash &^= *prevEscaped
-	follows := backslash<<1 | *prevEscaped
-	oddStarts := backslash &^ evenBits &^ follows
-	seq, carry := bits.Add64(oddStarts, backslash, 0)
-	*prevEscaped = carry
-	return (evenBits ^ seq<<1) & follows
-}
+func escapedStringEndAVX2(p *byte, n int) int
 
 func escapedStringEnd(b []byte, pos *int) (end int, done, ok bool) {
-	if !useAVX2 {
+	if !useEscapeKernel() {
 		return escapedStringEndScalar(b, pos)
 	}
-	if end, ok = escapedStringBlocks(b, *pos); !ok {
-		end, ok = scalarStringEnd(b, *pos)
+	i := *pos
+	if len(b)-i >= BlockLen {
+		if r := escapedStringEndAVX2(&b[i], len(b)-i); r >= 0 {
+			return i + r, true, true
+		}
 	}
+	end, ok = scalarStringEnd(b, i)
 	return end, true, ok
 }
 
-func escapedStringBlocks(b []byte, i int) (int, bool) {
-	var prevEscaped, pendingHex uint64
-	var pad [BlockLen]byte
-	var m escapeBlock
-	for {
-		if i+BlockLen <= len(b) {
-			escapeMasksAVX2(&b[i], &m)
-		} else {
-			copy(pad[:], b[i:])
-			escapeMasksAVX2(&pad[0], &m)
+func escapedStringValid(b []byte, i int) (int, bool) {
+	if useEscapeKernel() && len(b)-i >= BlockLen {
+		if r := escapedStringEndAVX2(&b[i], len(b)-i); r >= 0 {
+			return i + r, true
 		}
-		escaped := escapedMask(m.bslash, &prevEscaped)
-		unicode := escaped &^ m.notU
-		required := pendingHex | unicode<<1 | unicode<<2 | unicode<<3 | unicode<<4
-		pendingHex = unicode>>(BlockLen-1) | unicode>>(BlockLen-2) | unicode>>(BlockLen-3) | unicode>>unicodeCarryAt
-		quote := m.quote &^ escaped
-		upto := ^uint64(0)
-		if quote != 0 {
-			upto = quote ^ (quote - 1)
-		}
-		if bad := (m.ctrl | escaped&m.notSimple&m.notU | required&m.notHex) & upto; bad != 0 {
-			return i + bits.TrailingZeros64(bad), false
-		}
-		if quote != 0 {
-			return i + bits.TrailingZeros64(quote), true
-		}
-		i += BlockLen
 	}
+	return scalarStringEnd(b, i)
 }
 
 func scalarStringEnd(b []byte, i int) (int, bool) {

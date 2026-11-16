@@ -8,7 +8,10 @@ import (
 	"testing"
 )
 
-const formatSampleRounds = 300_000
+const (
+	formatSampleRounds = 300_000
+	float64CacheKMax   = 330
+)
 
 func powRat(base int64, exp int) *big.Rat {
 	p := new(big.Int).Exp(big.NewInt(base), big.NewInt(int64(abs(exp))), nil)
@@ -51,19 +54,18 @@ func TestLogApproximationsMatchBig(t *testing.T) {
 	}
 }
 
-func TestSchubfachTableMatchesBig(t *testing.T) {
-	if len(schubfachG) != schubfachKMax-schubfachKMin+1 {
-		t.Fatalf("table has %d entries, want %d", len(schubfachG), schubfachKMax-schubfachKMin+1)
-	}
-	mask := new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 63), big.NewInt(1))
-	for k := schubfachKMin; k <= schubfachKMax; k++ {
-		r := floorLog2Pow10Wide(-k) - 125
-		v := new(big.Rat).Mul(powRat(10, -k), powRat(2, -r))
+func TestCeilPow10MatchesBig(t *testing.T) {
+	for k := -float64CacheKMax; k <= float64CacheKMax; k++ {
+		r := floorLog2Pow10Wide(k) - 127
+		v := new(big.Rat).Mul(powRat(10, k), powRat(2, -r))
 		g := new(big.Int).Div(v.Num(), v.Denom())
-		g.Add(g, big.NewInt(1))
-		got := schubfachG[k-schubfachKMin]
-		if got[0] != new(big.Int).Rsh(g, 63).Uint64() || got[1] != new(big.Int).And(g, mask).Uint64() {
-			t.Fatalf("schubfachG[%d] = %#x %#x, want %s", k, got[0], got[1], g.Text(16))
+		if !v.IsInt() {
+			g.Add(g, big.NewInt(1))
+		}
+		hi, lo := ceilPow10(k)
+		want := new(big.Int).Or(new(big.Int).Lsh(new(big.Int).SetUint64(hi), 64), new(big.Int).SetUint64(lo))
+		if g.Cmp(want) != 0 {
+			t.Fatalf("ceilPow10(%d) = %s, want %s", k, want.Text(16), g.Text(16))
 		}
 	}
 }

@@ -52,6 +52,10 @@ func hex4(b []byte, i int) (rune, bool) {
 
 func AppendUnquoted(dst, b []byte, i int) ([]byte, int, bool) {
 	for {
+		var closed bool
+		if dst, i, closed = unquoteFast(dst, b, i); closed {
+			return dst, i, true
+		}
 		var j int
 		dst, j = copySafeRun(dst, b, i)
 		if j >= len(b) {

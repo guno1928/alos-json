@@ -19,10 +19,6 @@ type deepStack [MaxDepth/levelWordBits + 1]uint64
 
 var deepStackPool = sync.Pool{New: func() any { return new(deepStack) }}
 
-func Valid(b []byte) bool {
-	return validFast(b)
-}
-
 func validScalar(b []byte) bool {
 	end, ok := ValueEnd(b, SkipSpace(b, 0), 0)
 	return ok && SkipSpace(b, end) == len(b)
@@ -106,7 +102,7 @@ value:
 				break
 			}
 		}
-		if end, _, ok := StringEnd(b, i); ok {
+		if end, ok := skipStringBody(b, i); ok {
 			i = end + 1
 			goto afterValue
 		}
@@ -194,7 +190,7 @@ key:
 			break
 		}
 	}
-	if end, _, ok := StringEnd(b, i); ok {
+	if end, ok := skipStringBody(b, i); ok {
 		i = end + 1
 		goto afterKey
 	}
@@ -263,6 +259,14 @@ exponent:
 		i = digitRunEnd(p, n, i+1)
 	}
 	goto afterValue
+}
+
+func skipStringBody(b []byte, i int) (int, bool) {
+	if i < len(b) && b[i] == '\\' {
+		return escapedStringValid(b, i)
+	}
+	end, _, ok := StringEnd(b, i)
+	return end, ok
 }
 
 func hasLiteral(b []byte, p int, lit string) bool {

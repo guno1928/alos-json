@@ -8,40 +8,49 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 
 	"github.com/guno1928/alos-json/internal/fnum"
 	"github.com/guno1928/alos-json/jsontext"
 )
 
-const initialEncodeBufCap = 4096
+const (
+	initialEncodeBufCap = 4096
+	handoffStringLen    = 32 << 10
+)
 
-type encodeFunc func(e *encodeState, p unsafe.Pointer) error
+type encodeFunc func(e *encodeState, b []byte, p unsafe.Pointer) ([]byte, error)
 
 type typeEncoder struct {
 	fn          encodeFunc
+	rtype       unsafe.Pointer
 	directIface bool
 	custom      bool
 }
 
 type encodeState struct {
-	buf      []byte
-	base     int
-	opts     Options
-	encoders *encoderCache
+	buf        []byte
+	opts       Options
+	encoders   *encoderCache
+	pooledData *byte
+	handoff    *byte
 }
 
-func (e *encodeState) appendInt(v int64) {
-	e.buf = fnum.AppendInt64(e.buf, e.base, v)
+func (e *encodeState) appendInt(b []byte, v int64) []byte {
+	return fnum.AppendInt64(b, v)
 }
 
-func (e *encodeState) appendUint(v uint64) {
-	e.buf = fnum.AppendUint64(e.buf, e.base, v)
+func (e *encodeState) appendUint(b []byte, v uint64) []byte {
+	return fnum.AppendUint64(b, v)
 }
 
 var encodeStatePool = sync.Pool{New: func() any { return &encodeState{buf: make([]byte, 0, initialEncodeBufCap)} }}
 
+const typeSlotCount = 256
+
 type encoderCache struct {
+	slots      [typeSlotCount]atomic.Pointer[typeEncoder]
 	types      sync.Map
 	mu         sync.Mutex
 	marshalers *Marshalers
@@ -49,11 +58,30 @@ type encoderCache struct {
 	dynamicAny bool
 }
 
+func typePointer(t reflect.Type) unsafe.Pointer {
+	return (*[2]unsafe.Pointer)(unsafe.Pointer(&t))[1]
+}
+
+func typeSlotIndex(rtype unsafe.Pointer) uintptr {
+	return uintptr(rtype) >> 5 & (typeSlotCount - 1)
+}
+
 func newEncoderCache(m *Marshalers, flags uint64) *encoderCache {
 	return &encoderCache{marshalers: m, flags: flags, dynamicAny: m != nil || flags&flagStringifyNumbers != 0}
 }
 
 func (c *encoderCache) encoderFor(t reflect.Type) *typeEncoder {
+	rtype := typePointer(t)
+	slot := &c.slots[typeSlotIndex(rtype)]
+	if te := slot.Load(); te != nil && te.rtype == rtype {
+		return te
+	}
+	te := c.loadOrBuild(t)
+	slot.Store(te)
+	return te
+}
+
+func (c *encoderCache) loadOrBuild(t reflect.Type) *typeEncoder {
 	if v, ok := c.types.Load(t); ok {
 		return v.(*typeEncoder)
 	}
@@ -80,6 +108,10 @@ func (b *encoderBuilder) has(flag uint64) bool {
 	return b.cache.flags&flag != 0
 }
 
+func (b *encoderBuilder) plainPointer(t reflect.Type) bool {
+	return t.Kind() == reflect.Pointer && !hasCustomMarshaler(t) && len(b.cache.marshalers.applicable(t)) == 0
+}
+
 func (b *encoderBuilder) build(t reflect.Type) *typeEncoder {
 	if v, ok := b.cache.types.Load(t); ok {
 		return v.(*typeEncoder)
@@ -87,7 +119,7 @@ func (b *encoderBuilder) build(t reflect.Type) *typeEncoder {
 	if te, ok := b.building[t]; ok {
 		return te
 	}
-	te := &typeEncoder{directIface: isDirectIface(t)}
+	te := &typeEncoder{rtype: typePointer(t), directIface: isDirectIface(t)}
 	b.building[t] = te
 	te.fn = makeEncodeFunc(t, b)
 	if fns := b.cache.marshalers.applicable(t); len(fns) > 0 {
@@ -106,12 +138,11 @@ func makeEncodeFunc(t reflect.Type, b *encoderBuilder) encodeFunc {
 }
 
 func nilSafe(fn encodeFunc) encodeFunc {
-	return func(e *encodeState, p unsafe.Pointer) error {
+	return func(e *encodeState, b []byte, p unsafe.Pointer) ([]byte, error) {
 		if *(*unsafe.Pointer)(p) == nil {
-			e.buf = append(e.buf, "null"...)
-			return nil
+			return append(b, "null"...), nil
 		}
-		return fn(e, p)
+		return fn(e, b, p)
 	}
 }
 
@@ -133,13 +164,12 @@ func makeMethodOrKindEncodeFunc(t reflect.Type, b *encoderBuilder) encodeFunc {
 }
 
 func quotedNumber(fn encodeFunc) encodeFunc {
-	return func(e *encodeState, p unsafe.Pointer) error {
-		e.buf = append(e.buf, '"')
-		if err := fn(e, p); err != nil {
-			return err
+	return func(e *encodeState, b []byte, p unsafe.Pointer) ([]byte, error) {
+		b, err := fn(e, append(b, '"'), p)
+		if err != nil {
+			return b, err
 		}
-		e.buf = append(e.buf, '"')
-		return nil
+		return append(b, '"'), nil
 	}
 }
 
@@ -177,8 +207,14 @@ func makeKindEncodeFunc(t reflect.Type, b *encoderBuilder) encodeFunc {
 		if t.Elem().Kind() == reflect.Uint8 {
 			return encodeBytes
 		}
-		if fn := integerSliceEncoder(t.Elem()); fn != nil && b.nativeOK() {
+		if fn := numberSliceEncoder(t.Elem()); fn != nil && b.nativeOK() {
 			return fn
+		}
+		if t.Elem().Kind() == reflect.String && !hasCustomMarshaler(t.Elem()) && b.nativeOK() {
+			return encodeStringSlice
+		}
+		if b.plainPointer(t.Elem()) {
+			return encodePointerSlice(b.build(t.Elem().Elem()))
 		}
 		return encodeSlice(t, b.build(t.Elem()))
 	case reflect.Array:
@@ -195,22 +231,34 @@ func makeKindEncodeFunc(t reflect.Type, b *encoderBuilder) encodeFunc {
 		}
 		return encodeNonEmptyInterface(t)
 	default:
-		return func(*encodeState, unsafe.Pointer) error { return newSemanticError(t, "unsupported type") }
+		return func(_ *encodeState, b []byte, _ unsafe.Pointer) ([]byte, error) {
+			return b, newSemanticError(t, "unsupported type")
+		}
 	}
 }
 
-func (e *encodeState) appendString(s string) {
-	if e.opts.has(flagEscapeHTML) {
-		e.buf = jsontext.AppendQuoteStringHTML(e.buf, s)
-		return
+func (e *encodeState) appendString(b []byte, s string) []byte {
+	return appendQuotedString(b, s, e.opts.has(flagEscapeHTML))
+}
+
+func (e *encodeState) appendLargeString(b []byte, s string) []byte {
+	before := unsafe.SliceData(b)
+	b = e.appendString(b, s)
+	if after := unsafe.SliceData(b); before == e.pooledData && before != nil && after != before {
+		e.handoff = after
 	}
-	e.buf = appendJStr(e.buf, s)
+	return b
+}
+
+func (e *encodeState) canHandOff() bool {
+	return e.handoff != nil && unsafe.SliceData(e.buf) == e.handoff
 }
 
 func marshalFast(v any, opts []Option) ([]byte, error) {
 	e := encodeStatePool.Get().(*encodeState)
 	e.buf = e.buf[:0]
-	e.base = 0
+	pooled := e.buf
+	e.pooledData, e.handoff = unsafe.SliceData(pooled), nil
 	e.opts = Options{}
 	for _, fn := range opts {
 		fn(&e.opts)
@@ -222,31 +270,33 @@ func marshalFast(v any, opts []Option) ([]byte, error) {
 	case err != nil:
 	case e.opts.has(flagMultiline):
 		out = appendIndented(make([]byte, 0, len(e.buf)*2), e.buf, e.opts.prefix, e.opts.indent)
+	case e.canHandOff():
+		out = e.buf
+		e.buf = pooled
 	default:
 		out = make([]byte, len(e.buf))
 		copy(out, e.buf)
 	}
+	e.pooledData, e.handoff = nil, nil
 	encodeStatePool.Put(e)
 	return out, err
 }
 
 func marshalAppendFast(dst []byte, v any, opts []Option) ([]byte, error) {
 	e := encodeStatePool.Get().(*encodeState)
-	own := e.buf
-	e.buf, e.base, e.opts = dst, len(dst), Options{}
+	e.buf, e.opts = e.buf[:0], Options{}
 	for _, fn := range opts {
 		fn(&e.opts)
 	}
 	e.encoders = encodersFor(&e.opts)
 	err := e.marshalTop(v)
-	out := e.buf
 	if err == nil && e.opts.has(flagMultiline) {
-		own = appendIndented(own[:0], out[e.base:], e.opts.prefix, e.opts.indent)
-		out = append(out[:e.base], own...)
+		dst = appendIndented(dst, e.buf, e.opts.prefix, e.opts.indent)
+	} else {
+		dst = append(dst, e.buf...)
 	}
-	e.buf = own[:0]
 	encodeStatePool.Put(e)
-	return out, err
+	return dst, err
 }
 
 func appendIndented(dst, src []byte, prefix, indent string) []byte {
@@ -302,25 +352,29 @@ func appendIndentNewline(dst []byte, prefix, indent string, depth int) []byte {
 }
 
 func (e *encodeState) marshalTop(v any) error {
+	b, err := e.encodeTop(e.buf, v)
+	e.buf = b
+	return err
+}
+
+func (e *encodeState) encodeTop(b []byte, v any) ([]byte, error) {
 	for {
 		if v == nil {
-			e.buf = append(e.buf, "null"...)
-			return nil
+			return append(b, "null"...), nil
 		}
 		t := reflect.TypeOf(v)
 		if t.Kind() != reflect.Pointer {
-			return e.anyValue(v)
+			return e.anyValue(b, v)
 		}
-		rv := reflect.ValueOf(v)
-		if rv.IsNil() {
-			e.buf = append(e.buf, "null"...)
-			return nil
+		p := interfaceData(v)
+		if p == nil {
+			return append(b, "null"...), nil
 		}
-		elem := rv.Elem()
-		if elem.Kind() != reflect.Interface && elem.Kind() != reflect.Pointer {
-			return e.encoders.encoderFor(elem.Type()).fn(e, rv.UnsafePointer())
+		elem := t.Elem()
+		if k := elem.Kind(); k != reflect.Interface && k != reflect.Pointer {
+			return e.encoders.encoderFor(elem).fn(e, b, p)
 		}
-		v = elem.Interface()
+		v = reflect.NewAt(elem, p).Elem().Interface()
 	}
 }
 
@@ -333,177 +387,203 @@ func interfaceData(v any) unsafe.Pointer {
 	return (*emptyInterface)(unsafe.Pointer(&v)).data
 }
 
-func (e *encodeState) anyValue(v any) error {
+func (e *encodeState) anyValue(b []byte, v any) ([]byte, error) {
 	if e.encoders.dynamicAny {
-		return e.dynamicValue(v)
+		return e.dynamicValue(b, v)
 	}
-	return e.plainAnyValue(v)
+	return e.plainAnyValue(b, v)
 }
 
-func (e *encodeState) plainAnyValue(v any) error {
+func (e *encodeState) plainAnyValue(b []byte, v any) ([]byte, error) {
 	switch x := v.(type) {
 	case nil:
-		e.buf = append(e.buf, "null"...)
+		return append(b, "null"...), nil
 	case string:
-		e.appendString(x)
+		return e.appendString(b, x), nil
 	case float64:
-		return appendFloat(&e.buf, x, 64)
+		return appendFloat64(b, x)
 	case bool:
-		e.appendBool(x)
+		return appendBool(b, x), nil
 	case map[string]any:
-		return e.mapStringAny(x)
+		return e.mapStringAny(b, x)
 	case []any:
-		return e.anySlice(x)
+		return e.anySlice(b, x)
 	case int:
-		e.appendInt(int64(x))
+		return e.appendInt(b, int64(x)), nil
 	case int64:
-		e.appendInt(x)
+		return e.appendInt(b, x), nil
 	default:
-		return e.dynamicValue(v)
+		return e.dynamicValue(b, v)
 	}
-	return nil
 }
 
-func (e *encodeState) dynamicValue(v any) error {
+func (e *encodeState) dynamicValue(b []byte, v any) ([]byte, error) {
 	if v == nil {
-		e.buf = append(e.buf, "null"...)
-		return nil
+		return append(b, "null"...), nil
 	}
 	te := e.encoders.encoderFor(reflect.TypeOf(v))
 	if te.directIface {
 		word := interfaceData(v)
-		return te.fn(e, unsafe.Pointer(&word))
+		return te.fn(e, b, unsafe.Pointer(&word))
 	}
-	return te.fn(e, interfaceData(v))
+	return te.fn(e, b, interfaceData(v))
 }
 
-func (e *encodeState) appendBool(b bool) {
-	if b {
-		e.buf = append(e.buf, "true"...)
-	} else {
-		e.buf = append(e.buf, "false"...)
+func appendBool(b []byte, v bool) []byte {
+	if v {
+		return append(b, "true"...)
 	}
+	return append(b, "false"...)
 }
 
-func encodeInterface(e *encodeState, p unsafe.Pointer) error {
-	return e.anyValue(*(*any)(p))
+func encodeInterface(e *encodeState, b []byte, p unsafe.Pointer) ([]byte, error) {
+	return e.anyValue(b, *(*any)(p))
 }
 
 func encodeNonEmptyInterface(t reflect.Type) encodeFunc {
-	return func(e *encodeState, p unsafe.Pointer) error {
+	return func(e *encodeState, b []byte, p unsafe.Pointer) ([]byte, error) {
 		v := reflect.NewAt(t, p).Elem()
 		if v.IsNil() {
-			e.buf = append(e.buf, "null"...)
-			return nil
+			return append(b, "null"...), nil
 		}
-		return e.anyValue(v.Elem().Interface())
+		return e.anyValue(b, v.Elem().Interface())
 	}
 }
 
-func encodeBool(e *encodeState, p unsafe.Pointer) error {
-	e.appendBool(*(*bool)(p))
-	return nil
+func encodeBool(_ *encodeState, b []byte, p unsafe.Pointer) ([]byte, error) {
+	return appendBool(b, *(*bool)(p)), nil
 }
 
-func encodeInt(e *encodeState, p unsafe.Pointer) error {
-	e.appendInt(int64(*(*int)(p)))
-	return nil
+func encodeInt(e *encodeState, b []byte, p unsafe.Pointer) ([]byte, error) {
+	return e.appendInt(b, int64(*(*int)(p))), nil
 }
 
-func encodeInt8(e *encodeState, p unsafe.Pointer) error {
-	e.appendInt(int64(*(*int8)(p)))
-	return nil
+func encodeInt8(e *encodeState, b []byte, p unsafe.Pointer) ([]byte, error) {
+	return e.appendInt(b, int64(*(*int8)(p))), nil
 }
 
-func encodeInt16(e *encodeState, p unsafe.Pointer) error {
-	e.appendInt(int64(*(*int16)(p)))
-	return nil
+func encodeInt16(e *encodeState, b []byte, p unsafe.Pointer) ([]byte, error) {
+	return e.appendInt(b, int64(*(*int16)(p))), nil
 }
 
-func encodeInt32(e *encodeState, p unsafe.Pointer) error {
-	e.appendInt(int64(*(*int32)(p)))
-	return nil
+func encodeInt32(e *encodeState, b []byte, p unsafe.Pointer) ([]byte, error) {
+	return e.appendInt(b, int64(*(*int32)(p))), nil
 }
 
-func encodeInt64(e *encodeState, p unsafe.Pointer) error {
-	e.appendInt(*(*int64)(p))
-	return nil
+func encodeInt64(e *encodeState, b []byte, p unsafe.Pointer) ([]byte, error) {
+	return e.appendInt(b, *(*int64)(p)), nil
 }
 
-func encodeUint(e *encodeState, p unsafe.Pointer) error {
-	e.appendUint(uint64(*(*uint)(p)))
-	return nil
+func encodeUint(e *encodeState, b []byte, p unsafe.Pointer) ([]byte, error) {
+	return e.appendUint(b, uint64(*(*uint)(p))), nil
 }
 
-func encodeUint8(e *encodeState, p unsafe.Pointer) error {
-	e.appendUint(uint64(*(*uint8)(p)))
-	return nil
+func encodeUint8(e *encodeState, b []byte, p unsafe.Pointer) ([]byte, error) {
+	return e.appendUint(b, uint64(*(*uint8)(p))), nil
 }
 
-func encodeUint16(e *encodeState, p unsafe.Pointer) error {
-	e.appendUint(uint64(*(*uint16)(p)))
-	return nil
+func encodeUint16(e *encodeState, b []byte, p unsafe.Pointer) ([]byte, error) {
+	return e.appendUint(b, uint64(*(*uint16)(p))), nil
 }
 
-func encodeUint32(e *encodeState, p unsafe.Pointer) error {
-	e.appendUint(uint64(*(*uint32)(p)))
-	return nil
+func encodeUint32(e *encodeState, b []byte, p unsafe.Pointer) ([]byte, error) {
+	return e.appendUint(b, uint64(*(*uint32)(p))), nil
 }
 
-func encodeUint64(e *encodeState, p unsafe.Pointer) error {
-	e.appendUint(*(*uint64)(p))
-	return nil
+func encodeUint64(e *encodeState, b []byte, p unsafe.Pointer) ([]byte, error) {
+	return e.appendUint(b, *(*uint64)(p)), nil
 }
 
-func encodeFloat32(e *encodeState, p unsafe.Pointer) error {
-	return appendFloat(&e.buf, float64(*(*float32)(p)), 32)
+func encodeFloat32(_ *encodeState, b []byte, p unsafe.Pointer) ([]byte, error) {
+	err := appendFloat(&b, float64(*(*float32)(p)), 32)
+	return b, err
 }
 
-func encodeFloat64(e *encodeState, p unsafe.Pointer) error {
-	return appendFloat(&e.buf, *(*float64)(p), 64)
+func encodeFloat64(_ *encodeState, b []byte, p unsafe.Pointer) ([]byte, error) {
+	return appendFloat64(b, *(*float64)(p))
 }
 
-func encodeString(e *encodeState, p unsafe.Pointer) error {
-	e.appendString(*(*string)(p))
-	return nil
-}
-
-func encodeBytes(e *encodeState, p unsafe.Pointer) error {
-	b := *(*[]byte)(p)
-	if b == nil {
-		e.buf = append(e.buf, "null"...)
-		return nil
+func encodeString(e *encodeState, b []byte, p unsafe.Pointer) ([]byte, error) {
+	s := *(*string)(p)
+	if len(s) >= handoffStringLen {
+		return e.appendLargeString(b, s), nil
 	}
-	n := base64.StdEncoding.EncodedLen(len(b))
-	e.buf = append(e.buf, '"')
-	start := len(e.buf)
-	e.buf = growSlice(e.buf, n)
-	base64.StdEncoding.Encode(e.buf[start:start+n], b)
-	e.buf = append(e.buf, '"')
-	return nil
+	return e.appendString(b, s), nil
 }
 
-func (e *encodeState) nilSlice() {
+func encodeBytes(_ *encodeState, b []byte, p unsafe.Pointer) ([]byte, error) {
+	src := *(*[]byte)(p)
+	if src == nil {
+		return append(b, "null"...), nil
+	}
+	n := base64.StdEncoding.EncodedLen(len(src))
+	b = append(b, '"')
+	start := len(b)
+	b = growSlice(b, n)
+	base64.StdEncoding.Encode(b[start:start+n], src)
+	return append(b, '"'), nil
+}
+
+func (e *encodeState) nilSlice(b []byte) []byte {
 	if e.opts.has(flagFormatNilSliceAsNull) {
-		e.buf = append(e.buf, "null"...)
-	} else {
-		e.buf = append(e.buf, '[', ']')
+		return append(b, "null"...)
 	}
+	return append(b, '[', ']')
 }
 
 func encodeSlice(t reflect.Type, elem *typeEncoder) encodeFunc {
 	size := t.Elem().Size()
-	return func(e *encodeState, p unsafe.Pointer) error {
+	return func(e *encodeState, b []byte, p unsafe.Pointer) ([]byte, error) {
 		hdr := (*sliceHeader)(p)
 		if hdr.data == nil {
-			e.nilSlice()
-			return nil
+			return e.nilSlice(b), nil
 		}
-		return e.elements(hdr.data, hdr.len, size, elem)
+		return e.elements(b, hdr.data, hdr.len, size, elem)
 	}
 }
 
-func integerSliceEncoder(elem reflect.Type) encodeFunc {
+func encodePointerSlice(target *typeEncoder) encodeFunc {
+	return func(e *encodeState, b []byte, p unsafe.Pointer) ([]byte, error) {
+		hdr := (*sliceHeader)(p)
+		if hdr.data == nil {
+			return e.nilSlice(b), nil
+		}
+		b = append(b, '[')
+		var err error
+		for i, ptr := range unsafe.Slice((*unsafe.Pointer)(hdr.data), hdr.len) {
+			if i > 0 {
+				b = append(b, ',')
+			}
+			if ptr == nil {
+				b = append(b, "null"...)
+			} else if b, err = target.fn(e, b, ptr); err != nil {
+				return b, err
+			}
+		}
+		return append(b, ']'), nil
+	}
+}
+
+func encodeStringSlice(e *encodeState, b []byte, p unsafe.Pointer) ([]byte, error) {
+	hdr := (*sliceHeader)(p)
+	if hdr.data == nil {
+		return e.nilSlice(b), nil
+	}
+	b = append(b, '[')
+	for i, s := range unsafe.Slice((*string)(hdr.data), hdr.len) {
+		if i > 0 {
+			b = append(b, ',')
+		}
+		if len(s) >= handoffStringLen {
+			b = e.appendLargeString(b, s)
+		} else {
+			b = e.appendString(b, s)
+		}
+	}
+	return append(b, ']'), nil
+}
+
+func numberSliceEncoder(elem reflect.Type) encodeFunc {
 	if hasCustomMarshaler(elem) {
 		return nil
 	}
@@ -526,118 +606,148 @@ func integerSliceEncoder(elem reflect.Type) encodeFunc {
 		return encodeUnsignedSlice[uint32]
 	case reflect.Uint64:
 		return encodeUnsignedSlice[uint64]
+	case reflect.Float64:
+		return encodeFloat64Slice
 	}
 	return nil
 }
 
-func encodeSignedSlice[T int | int8 | int16 | int32 | int64](e *encodeState, p unsafe.Pointer) error {
+func encodeSignedSlice[T int | int8 | int16 | int32 | int64](e *encodeState, b []byte, p unsafe.Pointer) ([]byte, error) {
 	hdr := (*sliceHeader)(p)
 	if hdr.data == nil {
-		e.nilSlice()
-		return nil
+		return e.nilSlice(b), nil
 	}
-	e.buf = append(e.buf, '[')
-	for i, v := range unsafe.Slice((*T)(hdr.data), hdr.len) {
-		if i > 0 {
-			e.buf = append(e.buf, ',')
+	b = append(b, '[')
+	if fnum.IntListKernelUseful(hdr.len, unsafe.Sizeof(T(0))) {
+		return closeList(fnum.AppendIntListKernel(b, unsafe.Slice((*T)(hdr.data), hdr.len)), hdr.len), nil
+	}
+	for _, v := range unsafe.Slice((*T)(hdr.data), hdr.len) {
+		u := uint64(v)
+		if v < 0 {
+			b = append(b, '-')
+			u = -u
 		}
-		e.appendInt(int64(v))
+		b = append(fnum.AppendUint64(b, u), ',')
 	}
-	e.buf = append(e.buf, ']')
-	return nil
+	return closeList(b, hdr.len), nil
 }
 
-func encodeUnsignedSlice[T uint | uint16 | uint32 | uint64](e *encodeState, p unsafe.Pointer) error {
+func encodeUnsignedSlice[T uint | uint16 | uint32 | uint64](e *encodeState, b []byte, p unsafe.Pointer) ([]byte, error) {
 	hdr := (*sliceHeader)(p)
 	if hdr.data == nil {
-		e.nilSlice()
-		return nil
+		return e.nilSlice(b), nil
 	}
-	e.buf = append(e.buf, '[')
-	for i, v := range unsafe.Slice((*T)(hdr.data), hdr.len) {
-		if i > 0 {
-			e.buf = append(e.buf, ',')
+	b = append(b, '[')
+	if fnum.IntListKernelUseful(hdr.len, unsafe.Sizeof(T(0))) {
+		return closeList(fnum.AppendUintListKernel(b, unsafe.Slice((*T)(hdr.data), hdr.len)), hdr.len), nil
+	}
+	for _, v := range unsafe.Slice((*T)(hdr.data), hdr.len) {
+		b = append(fnum.AppendUint64(b, uint64(v)), ',')
+	}
+	return closeList(b, hdr.len), nil
+}
+
+func encodeFloat64Slice(e *encodeState, b []byte, p unsafe.Pointer) ([]byte, error) {
+	hdr := (*sliceHeader)(p)
+	if hdr.data == nil {
+		return e.nilSlice(b), nil
+	}
+	b = append(b, '[')
+	for _, f := range unsafe.Slice((*float64)(hdr.data), hdr.len) {
+		b = slices.Grow(b, fnum.FloatWindow)
+		w := floatWindow(b)
+		n := fnum.PutFloat64(w, f)
+		if n == 0 {
+			if err := appendFloat(&b, f, 64); err != nil {
+				return b, err
+			}
+			b = append(b, ',')
+			continue
 		}
-		e.appendUint(uint64(v))
+		w[n] = ','
+		b = b[:len(b)+n+1]
 	}
-	e.buf = append(e.buf, ']')
-	return nil
+	return closeList(b, hdr.len), nil
+}
+
+func closeList(b []byte, n int) []byte {
+	if n == 0 {
+		return append(b, ']')
+	}
+	b[len(b)-1] = ']'
+	return b
 }
 
 func encodeArray(t reflect.Type, elem *typeEncoder) encodeFunc {
 	size, n := t.Elem().Size(), t.Len()
-	return func(e *encodeState, p unsafe.Pointer) error {
-		return e.elements(p, n, size, elem)
+	return func(e *encodeState, b []byte, p unsafe.Pointer) ([]byte, error) {
+		return e.elements(b, p, n, size, elem)
 	}
 }
 
-func (e *encodeState) elements(data unsafe.Pointer, n int, size uintptr, elem *typeEncoder) error {
-	e.buf = append(e.buf, '[')
+func (e *encodeState) elements(b []byte, data unsafe.Pointer, n int, size uintptr, elem *typeEncoder) ([]byte, error) {
+	b = append(b, '[')
 	for i := range n {
 		if i > 0 {
-			e.buf = append(e.buf, ',')
+			b = append(b, ',')
 		}
-		if err := elem.fn(e, unsafe.Add(data, uintptr(i)*size)); err != nil {
-			return err
+		var err error
+		if b, err = elem.fn(e, b, unsafe.Add(data, uintptr(i)*size)); err != nil {
+			return b, err
 		}
 	}
-	e.buf = append(e.buf, ']')
-	return nil
+	return append(b, ']'), nil
 }
 
-func (e *encodeState) anySlice(s []any) error {
+func (e *encodeState) anySlice(b []byte, s []any) ([]byte, error) {
 	if s == nil {
-		e.nilSlice()
-		return nil
+		return e.nilSlice(b), nil
 	}
-	e.buf = append(e.buf, '[')
+	b = append(b, '[')
 	for i, v := range s {
 		if i > 0 {
-			e.buf = append(e.buf, ',')
+			b = append(b, ',')
 		}
-		if err := e.plainAnyValue(v); err != nil {
-			return err
+		var err error
+		if b, err = e.plainAnyValue(b, v); err != nil {
+			return b, err
 		}
 	}
-	e.buf = append(e.buf, ']')
-	return nil
+	return append(b, ']'), nil
 }
 
 func encodePointer(elem *typeEncoder) encodeFunc {
-	return func(e *encodeState, p unsafe.Pointer) error {
+	return func(e *encodeState, b []byte, p unsafe.Pointer) ([]byte, error) {
 		target := *(*unsafe.Pointer)(p)
 		if target == nil {
-			e.buf = append(e.buf, "null"...)
-			return nil
+			return append(b, "null"...), nil
 		}
-		return elem.fn(e, target)
+		return elem.fn(e, b, target)
 	}
 }
 
-func (e *encodeState) nilMap() {
+func (e *encodeState) nilMap(b []byte) []byte {
 	if e.opts.has(flagFormatNilMapAsNull) {
-		e.buf = append(e.buf, "null"...)
-	} else {
-		e.buf = append(e.buf, '{', '}')
+		return append(b, "null"...)
 	}
+	return append(b, '{', '}')
 }
 
-func (e *encodeState) mapStringAny(m map[string]any) error {
+func (e *encodeState) mapStringAny(b []byte, m map[string]any) ([]byte, error) {
 	if m == nil {
-		e.nilMap()
-		return nil
+		return e.nilMap(b), nil
 	}
-	e.buf = append(e.buf, '{')
+	b = append(b, '{')
 	first := true
-	entry := func(k string, v any) error {
+	entry := func(b []byte, k string, v any) ([]byte, error) {
 		if !first {
-			e.buf = append(e.buf, ',')
+			b = append(b, ',')
 		}
 		first = false
-		e.appendString(k)
-		e.buf = append(e.buf, ':')
-		return e.plainAnyValue(v)
+		b = append(e.appendString(b, k), ':')
+		return e.plainAnyValue(b, v)
 	}
+	var err error
 	if e.opts.has(flagDeterministic) {
 		keys := make([]string, 0, len(m))
 		for k := range m {
@@ -645,19 +755,18 @@ func (e *encodeState) mapStringAny(m map[string]any) error {
 		}
 		slices.Sort(keys)
 		for _, k := range keys {
-			if err := entry(k, m[k]); err != nil {
-				return err
+			if b, err = entry(b, k, m[k]); err != nil {
+				return b, err
 			}
 		}
 	} else {
 		for k, v := range m {
-			if err := entry(k, v); err != nil {
-				return err
+			if b, err = entry(b, k, v); err != nil {
+				return b, err
 			}
 		}
 	}
-	e.buf = append(e.buf, '}')
-	return nil
+	return append(b, '}'), nil
 }
 
 func encodeMap(t reflect.Type, b *encoderBuilder) encodeFunc {
@@ -665,21 +774,19 @@ func encodeMap(t reflect.Type, b *encoderBuilder) encodeFunc {
 		return encodeReflectMap(t, b)
 	}
 	if t.Key().Kind() == reflect.String && t.Elem() == anyType {
-		return func(e *encodeState, p unsafe.Pointer) error {
-			return e.mapStringAny(*(*map[string]any)(p))
+		return func(e *encodeState, b []byte, p unsafe.Pointer) ([]byte, error) {
+			return e.mapStringAny(b, *(*map[string]any)(p))
 		}
 	}
 	if t.Key() == stringType {
 		switch t.Elem() {
 		case stringType:
-			return encodeNativeMap(func(e *encodeState, v string) error {
-				e.appendString(v)
-				return nil
+			return encodeNativeMap(func(e *encodeState, b []byte, v string) ([]byte, error) {
+				return e.appendString(b, v), nil
 			})
 		case intType:
-			return encodeNativeMap(func(e *encodeState, v int) error {
-				e.appendInt(int64(v))
-				return nil
+			return encodeNativeMap(func(e *encodeState, b []byte, v int) ([]byte, error) {
+				return e.appendInt(b, int64(v)), nil
 			})
 		}
 	}
@@ -692,100 +799,97 @@ func encodeReflectMap(t reflect.Type, b *encoderBuilder) encodeFunc {
 		key, customKeys = customMapKeyEncoder(t.Key(), fns), true
 	}
 	members := mapMembersEncoder(t, b.build(t.Elem()), key, customKeys)
-	return func(e *encodeState, p unsafe.Pointer) error {
+	return func(e *encodeState, b []byte, p unsafe.Pointer) ([]byte, error) {
 		m := reflect.NewAt(t, p).Elem()
 		if m.IsNil() {
-			e.nilMap()
-			return nil
+			return e.nilMap(b), nil
 		}
-		e.buf = append(e.buf, '{')
-		if err := members(e, m, true, nil); err != nil {
-			return err
+		b, err := members(e, append(b, '{'), m, true, nil)
+		if err != nil {
+			return b, err
 		}
-		e.buf = append(e.buf, '}')
-		return nil
+		return append(b, '}'), nil
 	}
 }
 
-type mapKeyEncoder func(e *encodeState, key reflect.Value) error
+type mapKeyEncoder func(e *encodeState, b []byte, key reflect.Value) ([]byte, error)
 
 func defaultMapKeyEncoder(keyType reflect.Type) mapKeyEncoder {
 	if keyType.Kind() == reflect.String {
-		return func(e *encodeState, key reflect.Value) error {
-			e.appendString(key.String())
-			return nil
+		return func(e *encodeState, b []byte, key reflect.Value) ([]byte, error) {
+			return e.appendString(b, key.String()), nil
 		}
 	}
-	return func(e *encodeState, key reflect.Value) error {
-		e.buf = appendMapKeyStr(e.buf, key)
-		return nil
+	return func(_ *encodeState, b []byte, key reflect.Value) ([]byte, error) {
+		return appendMapKeyStr(b, key), nil
 	}
 }
 
 func customMapKeyEncoder(keyType reflect.Type, fns []typedFunc[marshalFn]) mapKeyEncoder {
 	fallback := defaultMapKeyEncoder(keyType)
-	encode := customEncodeFunc(keyType, fns, func(e *encodeState, p unsafe.Pointer) error {
-		return fallback(e, reflect.NewAt(keyType, p).Elem())
+	encode := customEncodeFunc(keyType, fns, func(e *encodeState, b []byte, p unsafe.Pointer) ([]byte, error) {
+		return fallback(e, b, reflect.NewAt(keyType, p).Elem())
 	})
-	return func(e *encodeState, key reflect.Value) error {
-		start := len(e.buf)
-		if err := encode(e, key.Addr().UnsafePointer()); err != nil {
-			return err
+	return func(e *encodeState, b []byte, key reflect.Value) ([]byte, error) {
+		start := len(b)
+		b, err := encode(e, b, key.Addr().UnsafePointer())
+		if err != nil {
+			return b, err
 		}
-		if len(e.buf) == start || e.buf[start] != '"' {
-			return &SemanticError{GoType: keyType, Msg: "map key must encode as a JSON string"}
+		if len(b) == start || b[start] != '"' {
+			return b, &SemanticError{GoType: keyType, Msg: "map key must encode as a JSON string"}
 		}
-		return nil
+		return b, nil
 	}
 }
 
 func (key mapKeyEncoder) render(e *encodeState, keyVal reflect.Value) (raw []byte, name string, err error) {
-	start := len(e.buf)
-	if err := key(e, keyVal); err != nil {
+	if raw, err = key(e, nil, keyVal); err != nil {
 		return nil, "", err
 	}
-	raw = slices.Clone(e.buf[start:])
-	e.buf = e.buf[:start]
 	err = Unmarshal(raw, &name)
 	return raw, name, err
 }
 
-type mapMembersFunc func(e *encodeState, m reflect.Value, first bool, checkName func(string) error) error
+type mapMembersFunc func(e *encodeState, b []byte, m reflect.Value, first bool, checkName func(string) error) ([]byte, error)
 
 func mapMembersEncoder(t reflect.Type, elem *typeEncoder, key mapKeyEncoder, customKeys bool) mapMembersFunc {
 	keyType, elemType := t.Key(), t.Elem()
-	return func(e *encodeState, m reflect.Value, first bool, checkName func(string) error) error {
+	return func(e *encodeState, b []byte, m reflect.Value, first bool, checkName func(string) error) ([]byte, error) {
 		keyVal := reflect.New(keyType).Elem()
 		elemVal := reflect.New(elemType).Elem()
 		elemPtr := elemVal.Addr().UnsafePointer()
-		entry := func(rawKey []byte) error {
+		entry := func(b, rawKey []byte) ([]byte, error) {
 			if checkName != nil {
 				if err := checkName(keyVal.String()); err != nil {
-					return err
+					return b, err
 				}
 			}
 			if !first {
-				e.buf = append(e.buf, ',')
+				b = append(b, ',')
 			}
 			first = false
 			if rawKey != nil {
-				e.buf = append(e.buf, rawKey...)
-			} else if err := key(e, keyVal); err != nil {
-				return err
+				b = append(b, rawKey...)
+			} else {
+				var err error
+				if b, err = key(e, b, keyVal); err != nil {
+					return b, err
+				}
 			}
-			e.buf = append(e.buf, ':')
-			return elem.fn(e, elemPtr)
+			return elem.fn(e, append(b, ':'), elemPtr)
 		}
+		var err error
 		if !e.opts.has(flagDeterministic) {
 			iter := m.MapRange()
 			for iter.Next() {
 				keyVal.SetIterKey(iter)
 				elemVal.SetIterValue(iter)
-				if err := entry(nil); err != nil {
-					return err
+				if b, err = entry(b, nil); err != nil {
+					return b, err
 				}
 			}
-			return nil
+			return b, nil
 		}
 		keys := m.MapKeys()
 		names := make([]string, len(keys))
@@ -799,9 +903,8 @@ func mapMembersEncoder(t reflect.Type, elem *typeEncoder, key mapKeyEncoder, cus
 				continue
 			}
 			keyVal.Set(keys[i])
-			var err error
 			if rawKeys[i], names[i], err = key.render(e, keyVal); err != nil {
-				return err
+				return b, err
 			}
 		}
 		order := make([]int, len(keys))
@@ -816,32 +919,31 @@ func mapMembersEncoder(t reflect.Type, elem *typeEncoder, key mapKeyEncoder, cus
 			if customKeys {
 				rawKey = rawKeys[idx]
 			}
-			if err := entry(rawKey); err != nil {
-				return err
+			if b, err = entry(b, rawKey); err != nil {
+				return b, err
 			}
 		}
-		return nil
+		return b, nil
 	}
 }
 
-func encodeNativeMap[V any](appendValue func(e *encodeState, v V) error) encodeFunc {
-	return func(e *encodeState, p unsafe.Pointer) error {
+func encodeNativeMap[V any](appendValue func(e *encodeState, b []byte, v V) ([]byte, error)) encodeFunc {
+	return func(e *encodeState, b []byte, p unsafe.Pointer) ([]byte, error) {
 		m := *(*map[string]V)(p)
 		if m == nil {
-			e.nilMap()
-			return nil
+			return e.nilMap(b), nil
 		}
-		e.buf = append(e.buf, '{')
+		b = append(b, '{')
 		first := true
-		entry := func(k string, v V) error {
+		entry := func(b []byte, k string, v V) ([]byte, error) {
 			if !first {
-				e.buf = append(e.buf, ',')
+				b = append(b, ',')
 			}
 			first = false
-			e.appendString(k)
-			e.buf = append(e.buf, ':')
-			return appendValue(e, v)
+			b = append(e.appendString(b, k), ':')
+			return appendValue(e, b, v)
 		}
+		var err error
 		if e.opts.has(flagDeterministic) {
 			keys := make([]string, 0, len(m))
 			for k := range m {
@@ -849,31 +951,89 @@ func encodeNativeMap[V any](appendValue func(e *encodeState, v V) error) encodeF
 			}
 			slices.Sort(keys)
 			for _, k := range keys {
-				if err := entry(k, m[k]); err != nil {
-					return err
+				if b, err = entry(b, k, m[k]); err != nil {
+					return b, err
 				}
 			}
 		} else {
 			for k, v := range m {
-				if err := entry(k, v); err != nil {
-					return err
+				if b, err = entry(b, k, v); err != nil {
+					return b, err
 				}
 			}
 		}
-		e.buf = append(e.buf, '}')
-		return nil
+		return append(b, '}'), nil
 	}
 }
 
+const fieldPrefixPadLen = 32
+
 type fieldEncoder struct {
-	key    string
-	prefix string
-	te     *typeEncoder
-	typ    reflect.Type
+	prefixPad [fieldPrefixPadLen]byte
+	key       string
+	prefix    string
+	te        *typeEncoder
+	typ       reflect.Type
 	fieldLocation
-	omitZero  bool
-	omitEmpty bool
-	asString  bool
+	omitZero    bool
+	omitEmpty   bool
+	asString    bool
+	conditional bool
+	zeroCheck   omitCheck
+	emptyCheck  omitCheck
+}
+
+type omitCheck uint8
+
+const (
+	omitCheckReflect omitCheck = iota
+	omitCheckNilWord
+	omitCheckEmptyString
+	omitCheckEmptySlice
+	omitCheckNilSlice
+)
+
+var isZeroerType = reflect.TypeFor[IsZeroer]()
+
+func zeroCheckFor(t reflect.Type) omitCheck {
+	if reflect.PointerTo(t).Implements(isZeroerType) {
+		return omitCheckReflect
+	}
+	switch t.Kind() {
+	case reflect.Pointer, reflect.Interface, reflect.Map:
+		return omitCheckNilWord
+	case reflect.String:
+		return omitCheckEmptyString
+	case reflect.Slice:
+		return omitCheckNilSlice
+	}
+	return omitCheckReflect
+}
+
+func emptyCheckFor(t reflect.Type) omitCheck {
+	switch t.Kind() {
+	case reflect.Pointer, reflect.Interface:
+		return omitCheckNilWord
+	case reflect.String:
+		return omitCheckEmptyString
+	case reflect.Slice:
+		return omitCheckEmptySlice
+	}
+	return omitCheckReflect
+}
+
+func (c omitCheck) holds(t reflect.Type, fp unsafe.Pointer, reflectCheck func(reflect.Value) bool) bool {
+	switch c {
+	case omitCheckNilWord:
+		return *(*unsafe.Pointer)(fp) == nil
+	case omitCheckEmptyString:
+		return len(*(*string)(fp)) == 0
+	case omitCheckEmptySlice:
+		return (*sliceHeader)(fp).len == 0
+	case omitCheckNilSlice:
+		return (*sliceHeader)(fp).data == nil
+	}
+	return reflectCheck(reflect.NewAt(t, fp).Elem())
 }
 
 type fallbackEncoder struct {
@@ -905,7 +1065,11 @@ func encodeStruct(t reflect.Type, b *encoderBuilder) encodeFunc {
 			omitZero:      sf.omitZero,
 			omitEmpty:     sf.omitEmpty,
 			asString:      sf.asString,
+			conditional:   !sf.direct || sf.omitZero || sf.omitEmpty || omitZeroFields,
+			zeroCheck:     zeroCheckFor(sf.typ),
+			emptyCheck:    emptyCheckFor(sf.typ),
 		}
+		fields[i].setPrefix("," + fields[i].key)
 		if !sf.direct || sf.omitZero || sf.omitEmpty || sf.asString {
 			simple = false
 		}
@@ -921,88 +1085,101 @@ func encodeStruct(t reflect.Type, b *encoderBuilder) encodeFunc {
 			omitZeroFields: omitZeroFields,
 		}
 	}
-	general := func(e *encodeState, p unsafe.Pointer) error {
-		e.buf = append(e.buf, '{')
-		first := true
+	general := func(e *encodeState, b []byte, p unsafe.Pointer) ([]byte, error) {
+		b = append(b, '{')
+		skipComma := 1
+		var err error
 		for i := range fields {
 			f := &fields[i]
 			fp := unsafe.Add(p, f.offset)
-			if !f.direct {
+			if f.conditional {
 				var ok bool
-				if fp, ok = f.existing(t, p); !ok {
+				if fp, ok = f.present(t, p, omitZeroFields); !ok {
 					continue
 				}
 			}
-			if f.omitZero || f.omitEmpty || omitZeroFields {
-				fv := reflect.NewAt(f.typ, fp).Elem()
-				if (f.omitZero || omitZeroFields) && isZero(fv) || f.omitEmpty && isEmpty(fv) {
-					continue
-				}
-			}
-			if !first {
-				e.buf = append(e.buf, ',')
-			}
-			first = false
-			e.buf = append(e.buf, f.key...)
-			var err error
-			if f.asString {
-				err = e.quotedScalar(f.typ, f.te, fp)
+			if skipComma == 0 {
+				b = f.appendPrefix(b)
 			} else {
-				err = f.te.fn(e, fp)
+				b = append(b, f.key...)
+				skipComma = 0
+			}
+			if f.asString {
+				b, err = e.quotedScalar(b, f.typ, f.te, fp)
+			} else {
+				b, err = f.te.fn(e, b, fp)
 			}
 			if err != nil {
-				return err
+				return b, err
 			}
 		}
 		if fallback != nil {
-			if err := e.inlineMembers(fallback, first, p); err != nil {
-				return err
+			if b, err = e.inlineMembers(b, fallback, skipComma == 1, p); err != nil {
+				return b, err
 			}
 		}
-		e.buf = append(e.buf, '}')
-		return nil
+		return append(b, '}'), nil
 	}
 	if !simple || len(fields) == 0 {
 		return general
 	}
-	fields[0].prefix = "{" + fields[0].key
-	for i := 1; i < len(fields); i++ {
-		fields[i].prefix = "," + fields[i].key
-	}
-	return func(e *encodeState, p unsafe.Pointer) error {
+	fields[0].setPrefix("{" + fields[0].key)
+	return func(e *encodeState, b []byte, p unsafe.Pointer) ([]byte, error) {
+		var err error
 		for i := range fields {
 			f := &fields[i]
-			e.buf = append(e.buf, f.prefix...)
-			if err := f.te.fn(e, unsafe.Add(p, f.offset)); err != nil {
-				return err
+			if b, err = f.te.fn(e, f.appendPrefix(b), unsafe.Add(p, f.offset)); err != nil {
+				return b, err
 			}
 		}
-		e.buf = append(e.buf, '}')
-		return nil
+		return append(b, '}'), nil
 	}
 }
 
-func (f *fieldEncoder) omits(fv reflect.Value, omitZeroFields bool) bool {
-	return (f.omitZero || omitZeroFields) && isZero(fv) || f.omitEmpty && isEmpty(fv)
+func (f *fieldEncoder) setPrefix(prefix string) {
+	f.prefix = prefix
+	copy(f.prefixPad[:], prefix)
+}
+
+func (f *fieldEncoder) appendPrefix(b []byte) []byte {
+	if n := len(f.prefix); n < fieldPrefixPadLen && cap(b)-len(b) >= fieldPrefixPadLen {
+		*(*[fieldPrefixPadLen]byte)(b[len(b) : len(b)+fieldPrefixPadLen]) = f.prefixPad
+		return b[:len(b)+n]
+	}
+	return append(b, f.prefix...)
+}
+
+func (f *fieldEncoder) present(t reflect.Type, p unsafe.Pointer, omitZeroFields bool) (unsafe.Pointer, bool) {
+	fp := unsafe.Add(p, f.offset)
+	if !f.direct {
+		var ok bool
+		if fp, ok = f.existing(t, p); !ok {
+			return nil, false
+		}
+	}
+	if (f.omitZero || omitZeroFields) && f.zeroCheck.holds(f.typ, fp, isZero) || f.omitEmpty && f.emptyCheck.holds(f.typ, fp, isEmpty) {
+		return nil, false
+	}
+	return fp, true
 }
 
 func (f *fieldEncoder) written(t reflect.Type, p unsafe.Pointer, omitZeroFields bool) bool {
-	fp, ok := f.existing(t, p)
-	return ok && !f.omits(reflect.NewAt(f.typ, fp).Elem(), omitZeroFields)
+	_, ok := f.present(t, p, omitZeroFields)
+	return ok
 }
 
-func (e *encodeState) inlineMembers(fallback *fallbackEncoder, first bool, p unsafe.Pointer) error {
+func (e *encodeState) inlineMembers(b []byte, fallback *fallbackEncoder, first bool, p unsafe.Pointer) ([]byte, error) {
 	t, fs, fields, omitZeroFields := fallback.structType, fallback.structFields, fallback.fields, fallback.omitZeroFields
 	mp, ok := fallback.existing(t, p)
 	if !ok {
-		return nil
+		return b, nil
 	}
 	m := reflect.NewAt(fallback.typ, mp).Elem()
 	if m.Len() == 0 {
-		return nil
+		return b, nil
 	}
 	caseInsensitive := e.opts.has(flagMatchCaseInsensitive)
-	return fallback.members(e, m, first, func(name string) error {
+	return fallback.members(e, b, m, first, func(name string) error {
 		if i := fs.indexOf(name, caseInsensitive); i >= 0 && fields[i].written(t, p, omitZeroFields) {
 			return &SemanticError{GoType: t, Msg: "duplicate object member name " + strconv.Quote(name)}
 		}
@@ -1010,26 +1187,24 @@ func (e *encodeState) inlineMembers(fallback *fallbackEncoder, first bool, p uns
 	})
 }
 
-func (e *encodeState) quotedScalar(t reflect.Type, te *typeEncoder, p unsafe.Pointer) error {
+func (e *encodeState) quotedScalar(b []byte, t reflect.Type, te *typeEncoder, p unsafe.Pointer) ([]byte, error) {
 	for !te.custom && t.Kind() == reflect.Pointer {
 		p = *(*unsafe.Pointer)(p)
 		if p == nil {
-			e.buf = append(e.buf, "null"...)
-			return nil
+			return append(b, "null"...), nil
 		}
 		t = t.Elem()
 		te = e.encoders.encoderFor(t)
 	}
 	scalar, ok := scalarEncoders[t.Kind()]
 	if te.custom || !ok {
-		return te.fn(e, p)
+		return te.fn(e, b, p)
 	}
-	e.buf = append(e.buf, '"')
-	if err := scalar(e, p); err != nil {
-		return err
+	b, err := scalar(e, append(b, '"'), p)
+	if err != nil {
+		return b, err
 	}
-	e.buf = append(e.buf, '"')
-	return nil
+	return append(b, '"'), nil
 }
 
 var scalarEncoders = map[reflect.Kind]encodeFunc{
@@ -1047,33 +1222,31 @@ func methodValue(t reflect.Type, p unsafe.Pointer, iface reflect.Type) any {
 }
 
 func encodeMarshalerTo(t reflect.Type) encodeFunc {
-	return func(e *encodeState, p unsafe.Pointer) error {
-		enc := jsontext.WrapBuffer(e.buf)
+	return func(_ *encodeState, b []byte, p unsafe.Pointer) ([]byte, error) {
+		enc := jsontext.WrapBuffer(b)
 		err := methodValue(t, p, marshalerToType).(MarshalerTo).MarshalJSONTo(enc)
-		e.buf = enc.Bytes()
+		b = enc.Bytes()
 		jsontext.PutEncoder(enc)
-		return err
+		return b, err
 	}
 }
 
 func encodeMarshaler(t reflect.Type) encodeFunc {
-	return func(e *encodeState, p unsafe.Pointer) error {
-		b, err := methodValue(t, p, marshalerType).(Marshaler).MarshalJSON()
+	return func(_ *encodeState, b []byte, p unsafe.Pointer) ([]byte, error) {
+		out, err := methodValue(t, p, marshalerType).(Marshaler).MarshalJSON()
 		if err != nil {
-			return err
+			return b, err
 		}
-		e.buf = append(e.buf, b...)
-		return nil
+		return append(b, out...), nil
 	}
 }
 
 func encodeTextMarshaler(t reflect.Type) encodeFunc {
-	return func(e *encodeState, p unsafe.Pointer) error {
-		b, err := methodValue(t, p, textMarshalerType).(encoding.TextMarshaler).MarshalText()
+	return func(e *encodeState, b []byte, p unsafe.Pointer) ([]byte, error) {
+		out, err := methodValue(t, p, textMarshalerType).(encoding.TextMarshaler).MarshalText()
 		if err != nil {
-			return err
+			return b, err
 		}
-		e.appendString(b2s(b))
-		return nil
+		return e.appendString(b, b2s(out)), nil
 	}
 }

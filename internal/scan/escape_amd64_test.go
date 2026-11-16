@@ -7,71 +7,9 @@ import (
 	"testing"
 )
 
-func escapeBlockReference(b []byte) escapeBlock {
-	var m escapeBlock
-	for i := range BlockLen {
-		bit := uint64(1) << i
-		c := b[i]
-		if c == '"' {
-			m.quote |= bit
-		}
-		if c == '\\' {
-			m.bslash |= bit
-		}
-		if c < 0x20 {
-			m.ctrl |= bit
-		}
-		if !strings.ContainsRune(`"\/bfnrt`, rune(c)) || c >= 0x80 {
-			m.notSimple |= bit
-		}
-		if c != 'u' {
-			m.notU |= bit
-		}
-		if !isHex[c] {
-			m.notHex |= bit
-		}
-	}
-	return m
-}
-
-func TestEscapeMasksMatchReference(t *testing.T) {
-	if !useAVX2 {
-		t.Skip("no AVX2")
-	}
-	buf := make([]byte, BlockLen)
-	var got escapeBlock
-	check := func() {
-		t.Helper()
-		escapeMasksAVX2(&buf[0], &got)
-		if want := escapeBlockReference(buf); got != want {
-			t.Fatalf("escapeMasksAVX2(%q) = %+v, want %+v", buf, got, want)
-		}
-	}
-	for c := range 256 {
-		for pos := range BlockLen {
-			for i := range buf {
-				buf[i] = 'x'
-			}
-			buf[pos] = byte(c)
-			buf[(pos*13+7)%BlockLen] = byte(c)
-			check()
-		}
-	}
-	x := uint64(0x3C6EF372FE94F82B)
-	for range 50_000 {
-		for i := range buf {
-			x ^= x >> 12
-			x ^= x << 25
-			x ^= x >> 27
-			buf[i] = byte(x >> 56)
-		}
-		check()
-	}
-}
-
 func checkEscapedBlocks(t *testing.T, b []byte, start int) {
 	t.Helper()
-	if !useAVX2 {
+	if !useEscapeKernel() {
 		return
 	}
 	pos := start
@@ -133,50 +71,49 @@ func FuzzEscapedBlocks(f *testing.F) {
 	})
 }
 
-func escapedReference(b []byte) []bool {
-	out := make([]bool, len(b))
-	run := 0
-	for i, c := range b {
-		out[i] = run%2 == 1
-		if c == '\\' {
-			run++
-		} else {
-			run = 0
+func TestEscapedKernelClassifiesEveryByte(t *testing.T) {
+	contexts := []string{"", `\`, `\u`, `\u0`, `\u00`, `\u000`, `\\`, `\\\`}
+	for c := range 256 {
+		for _, ctx := range contexts {
+			for pos := 0; pos < 2*BlockLen+8; pos += 3 {
+				for _, after := range []string{`"`, `"` + strings.Repeat("y", 70)} {
+					b := []byte(strings.Repeat("q", pos) + ctx + string([]byte{byte(c)}) + "zz" + after)
+					checkEscapedBlocks(t, b, 0)
+					checkEscapedBlocks(t, b, pos)
+				}
+			}
 		}
 	}
-	return out
 }
 
-func TestEscapedMaskMatchesReference(t *testing.T) {
-	x := uint64(0x243F6A8885A308D3)
-	for range 20_000 {
-		n := BlockLen * (1 + int(x%4))
-		b := make([]byte, n)
+func TestEscapedKernelBackslashRuns(t *testing.T) {
+	alphabet := []byte{'\\', '\\', '\\', 'n', 'a', '"', 'u', '0', 'F', 0x01}
+	next := xorshiftBytes(0x243F6A8885A308D3)
+	for range 60_000 {
+		b := make([]byte, BlockLen+int(next()%(4*BlockLen)))
 		for i := range b {
-			x ^= x >> 12
-			x ^= x << 25
-			x ^= x >> 27
-			if x%3 == 0 {
-				b[i] = 'a'
-			} else {
-				b[i] = '\\'
-			}
+			b[i] = alphabet[next()%uint64(len(alphabet))]
 		}
-		want := escapedReference(b)
-		var prev uint64
-		for blk := 0; blk < n; blk += BlockLen {
-			var bs uint64
-			for i := range BlockLen {
-				if b[blk+i] == '\\' {
-					bs |= 1 << i
-				}
-			}
-			got := escapedMask(bs, &prev)
-			for i := range BlockLen {
-				if (got>>i&1 == 1) != want[blk+i] {
-					t.Fatalf("escaped bit %d of %q: got %v want %v", blk+i, b, got>>i&1 == 1, want[blk+i])
-				}
-			}
+		for start := range 4 {
+			checkEscapedBlocks(t, b, start)
+		}
+	}
+}
+
+func TestEscapedKernelTruncatedAtEveryLength(t *testing.T) {
+	var sb strings.Builder
+	for i, p := range escapePieces {
+		if p == `\` || p == `"` || p == `\\"` || p == `\\\"` || p == "\x01" || p == `\u12` || p == `\u12g4` || p == `\x` {
+			continue
+		}
+		sb.WriteString(p)
+		sb.WriteString(strings.Repeat("w", i%5))
+	}
+	body := sb.String()
+	doc := []byte(body + body + body + `"` + strings.Repeat("t", 40))
+	for n := 0; n <= len(doc); n++ {
+		for start := range 4 {
+			checkEscapedBlocks(t, doc[:n], min(start, n))
 		}
 	}
 }

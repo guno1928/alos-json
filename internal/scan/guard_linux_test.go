@@ -34,6 +34,7 @@ func exerciseScanEntryPoints(b []byte) {
 	Valid(b)
 	validFast(b)
 	validScalar(b)
+	exerciseIndexedValid(b)
 	SkipSpace(b, 0)
 	FindSafeString(b)
 	FindSafeStringHTML(b)

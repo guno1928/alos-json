@@ -6,7 +6,6 @@ import (
 )
 
 const (
-	float64QMin           = -1074
 	float64ExpOffset      = 1075
 	float64Precision      = 53
 	float64MantMask       = 1<<float64MantBits - 1
@@ -16,9 +15,21 @@ const (
 	log10Shift            = 41
 	log2Of10WideNumerator = 913_124_641_741
 	log2Of10WideShift     = 38
-	schubfachTableShift   = 2
-	mask63                = 1<<63 - 1
 	decimalBase           = 10
+	dbKappa               = 2
+	dbBigDivisor          = 1000
+	dbSmallDivisor        = 100
+	dbHalfSmallDivisor    = dbSmallDivisor / 2
+	exactPow10Max128      = 55
+	shorterTieExponent    = -77
+	shorterLeftIntMin     = 2
+	shorterLeftIntMax     = 3
+	carrierTopBit         = 63
+	carrierBits           = 64
+	shorterLeftShift      = float64MantBits + 2
+	shorterRightShift     = float64MantBits + 1
+	shorterEndpointBase   = carrierBits - float64MantBits - 1
+	shorterRoundBase      = carrierBits - float64MantBits - 2
 )
 
 func floorLog10Pow2(q int) int {
@@ -43,14 +54,7 @@ func Shortest64(f float64) (digits uint64, exp10 int, ok bool) {
 	if bq == 0 {
 		return 0, 0, t == 0
 	}
-	mq := float64ExpOffset - bq
-	c := float64CMin | t
-	if mq > 0 && mq < float64Precision {
-		if n := c >> uint(mq); n<<uint(mq) == c {
-			return n, 0, true
-		}
-	}
-	digits, exp10 = schubfach(-mq, c)
+	digits, exp10 = shortestNormal(b)
 	for digits%decimalBase == 0 {
 		digits /= decimalBase
 		exp10++
@@ -58,54 +62,99 @@ func Shortest64(f float64) (digits uint64, exp10 int, ok bool) {
 	return digits, exp10, true
 }
 
-func schubfach(q int, c uint64) (uint64, int) {
-	out := c & 1
-	cb := c << 2
-	cbr := cb + 2
-	var cbl uint64
-	var k int
-	if c != float64CMin || q == float64QMin {
-		cbl = cb - 2
-		k = floorLog10Pow2(q)
-	} else {
-		cbl = cb - 1
-		k = floorLog10ThreeQuartersPow2(q)
-	}
-	h := uint(q + floorLog2Pow10Wide(-k) + schubfachTableShift)
-	g := schubfachG[k-schubfachKMin]
-	vb := roundToOdd(g, cb<<h)
-	vbl := roundToOdd(g, cbl<<h)
-	vbr := roundToOdd(g, cbr<<h)
-	s := vb >> 2
-	sp10 := s / decimalBase * decimalBase
-	tp10 := sp10 + decimalBase
-	upin := vbl+out <= sp10<<2
-	wpin := tp10<<2+out <= vbr
-	if upin != wpin {
-		if upin {
-			return sp10, k
+func shortestNormal(b uint64) (uint64, int) {
+	bq := int(b >> float64MantBits)
+	t := b & float64MantMask
+	mq := float64ExpOffset - bq
+	c := float64CMin | t
+	if mq > 0 && mq < float64Precision {
+		if n := c >> uint(mq); n<<uint(mq) == c {
+			return n, 0
 		}
-		return tp10, k
 	}
-	t := s + 1
-	uin := vbl+out <= s<<2
-	win := t<<2+out <= vbr
-	if uin != win {
-		if uin {
-			return s, k
-		}
-		return t, k
+	if t == 0 && bq > 1 {
+		return shorterInterval(-mq)
 	}
-	mid := (s + t) << 1
-	if vb < mid || vb == mid && s&1 == 0 {
-		return s, k
-	}
-	return t, k
+	return regularInterval(c, -mq)
 }
 
-func roundToOdd(g [2]uint64, cp uint64) uint64 {
-	x1, _ := bits.Mul64(g[1], cp)
-	y1, y0 := bits.Mul64(g[0], cp)
-	z := y0>>1 + x1
-	return y1 + z>>63 | (z&mask63+mask63)>>63
+func ceilPow10(k int) (uint64, uint64) {
+	c := pow10Table[k-pow10Min]
+	if uint(k) <= exactPow10Max128 {
+		return c[0], c[1]
+	}
+	lo, carry := bits.Add64(c[1], 1, 0)
+	return c[0] + carry, lo
+}
+
+func mulUpper(u, hi, lo uint64) (uint64, bool) {
+	h1, l1 := bits.Mul64(u, hi)
+	h2, _ := bits.Mul64(u, lo)
+	mid, carry := bits.Add64(l1, h2, 0)
+	return h1 + carry, mid == 0
+}
+
+func mulParity(twoF, hi, lo uint64, beta int) (bool, bool) {
+	h2, l2 := bits.Mul64(twoF, lo)
+	rHi := twoF*hi + h2
+	parity := rHi>>uint(carrierBits-beta)&1 != 0
+	return parity, rHi<<uint(beta)|l2>>uint(carrierBits-beta) == 0
+}
+
+func regularInterval(significand uint64, exponent int) (uint64, int) {
+	twoFc := significand << 1
+	even := significand&1 == 0
+	minusK := floorLog10Pow2(exponent) - dbKappa
+	hi, lo := ceilPow10(-minusK)
+	beta := exponent + floorLog2Pow10Wide(-minusK)
+	deltai := uint32(hi >> uint(carrierTopBit-beta))
+	zi, zIsInteger := mulUpper((twoFc|1)<<uint(beta), hi, lo)
+	sig := zi / dbBigDivisor
+	r := uint32(zi - dbBigDivisor*sig)
+	switch {
+	case r < deltai:
+		if r != 0 || !zIsInteger || even {
+			return sig, minusK + dbKappa + 1
+		}
+		sig--
+		r = dbBigDivisor
+	case r == deltai:
+		xParity, xIsInteger := mulParity(twoFc-1, hi, lo, beta)
+		if xParity || xIsInteger && even {
+			return sig, minusK + dbKappa + 1
+		}
+	}
+	sig *= decimalBase
+	dist := r - deltai/2 + dbHalfSmallDivisor
+	approxYParity := (dist^dbHalfSmallDivisor)&1 != 0
+	q := dist / dbSmallDivisor
+	sig += uint64(q)
+	if q*dbSmallDivisor == dist {
+		yParity, yIsInteger := mulParity(twoFc, hi, lo, beta)
+		if yParity != approxYParity || sig&1 != 0 && yIsInteger {
+			sig--
+		}
+	}
+	return sig, minusK + dbKappa
+}
+
+func shorterInterval(exponent int) (uint64, int) {
+	minusK := floorLog10ThreeQuartersPow2(exponent)
+	beta := exponent + floorLog2Pow10Wide(-minusK)
+	hi, _ := ceilPow10(-minusK)
+	xi := (hi - hi>>shorterLeftShift) >> uint(shorterEndpointBase-beta)
+	zi := (hi + hi>>shorterRightShift) >> uint(shorterEndpointBase-beta)
+	if exponent < shorterLeftIntMin || exponent > shorterLeftIntMax {
+		xi++
+	}
+	if sig := zi / decimalBase; sig*decimalBase >= xi {
+		return sig, minusK + 1
+	}
+	sig := (hi>>uint(shorterRoundBase-beta) + 1) / 2
+	if sig&1 != 0 && exponent == shorterTieExponent {
+		sig--
+	} else if sig < xi {
+		sig++
+	}
+	return sig, minusK
 }

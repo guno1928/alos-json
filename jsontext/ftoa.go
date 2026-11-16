@@ -103,12 +103,7 @@ func FastAppendFloat(dst []byte, f float64, bits int) []byte {
 	return strconv.AppendFloat(dst, f, 'f', -1, bits)
 }
 
-const (
-	zeroPointPrefix = "0."
-	eightDigitBlock = 100_000_000
-	fourDigitBlock  = 10_000
-	twoDigitBlock   = 100
-)
+const zeroPointPrefix = "0."
 
 func appendFixedDecimal(dst []byte, digits uint64, n, exp10 int) []byte {
 	if exp10 >= 0 {
@@ -119,7 +114,7 @@ func appendFixedDecimal(dst []byte, digits uint64, n, exp10 int) []byte {
 	if point > 0 {
 		dst = slices.Grow(dst, n+1)[:start+n+1]
 		out := dst[start:]
-		writeDigits(out[1:], digits)
+		fnum.PutDecimal(out[1:], digits)
 		for i := 0; i < point; i++ {
 			out[i] = out[i+1]
 		}
@@ -129,46 +124,12 @@ func appendFixedDecimal(dst []byte, digits uint64, n, exp10 int) []byte {
 	pad := len(zeroPointPrefix) - point
 	dst = slices.Grow(dst, pad+n)[:start+pad+n]
 	out := dst[start:]
-	writeDigits(out[pad:], digits)
+	fnum.PutDecimal(out[pad:], digits)
 	copy(out, zeroPointPrefix)
 	for i := len(zeroPointPrefix); i < pad; i++ {
 		out[i] = '0'
 	}
 	return dst
-}
-
-func writeDigits(out []byte, v uint64) {
-	i := len(out)
-	for v >= eightDigitBlock {
-		q := v / eightDigitBlock
-		writeEightDigits(out[i-8:i], uint32(v-q*eightDigitBlock))
-		v = q
-		i -= 8
-	}
-	r := uint32(v)
-	for r >= twoDigitBlock {
-		q := r / twoDigitBlock
-		idx := (r - q*twoDigitBlock) * 2
-		r = q
-		i -= 2
-		out[i], out[i+1] = digitPairs[idx], digitPairs[idx+1]
-	}
-	if r >= 10 {
-		out[i-2], out[i-1] = digitPairs[r*2], digitPairs[r*2+1]
-	} else {
-		out[i-1] = byte('0' + r)
-	}
-}
-
-func writeEightDigits(out []byte, v uint32) {
-	_ = out[7]
-	hi, lo := v/fourDigitBlock, v%fourDigitBlock
-	h1, h2 := hi/twoDigitBlock*2, hi%twoDigitBlock*2
-	l1, l2 := lo/twoDigitBlock*2, lo%twoDigitBlock*2
-	out[0], out[1] = digitPairs[h1], digitPairs[h1+1]
-	out[2], out[3] = digitPairs[h2], digitPairs[h2+1]
-	out[4], out[5] = digitPairs[l1], digitPairs[l1+1]
-	out[6], out[7] = digitPairs[l2], digitPairs[l2+1]
 }
 
 func appendZeros(dst []byte, n int) []byte {

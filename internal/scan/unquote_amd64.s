@@ -1,0 +1,198 @@
+//go:build amd64 && !purego
+
+#include "textflag.h"
+
+DATA unqQuote<>+0(SB)/8, $0x2222222222222222
+DATA unqQuote<>+8(SB)/8, $0x2222222222222222
+DATA unqQuote<>+16(SB)/8, $0x2222222222222222
+DATA unqQuote<>+24(SB)/8, $0x2222222222222222
+GLOBL unqQuote<>(SB), (NOPTR+RODATA), $32
+
+DATA unqBslash<>+0(SB)/8, $0x5C5C5C5C5C5C5C5C
+DATA unqBslash<>+8(SB)/8, $0x5C5C5C5C5C5C5C5C
+DATA unqBslash<>+16(SB)/8, $0x5C5C5C5C5C5C5C5C
+DATA unqBslash<>+24(SB)/8, $0x5C5C5C5C5C5C5C5C
+GLOBL unqBslash<>(SB), (NOPTR+RODATA), $32
+
+DATA unqCtrlMax<>+0(SB)/8, $0x1F1F1F1F1F1F1F1F
+DATA unqCtrlMax<>+8(SB)/8, $0x1F1F1F1F1F1F1F1F
+DATA unqCtrlMax<>+16(SB)/8, $0x1F1F1F1F1F1F1F1F
+DATA unqCtrlMax<>+24(SB)/8, $0x1F1F1F1F1F1F1F1F
+GLOBL unqCtrlMax<>(SB), (NOPTR+RODATA), $32
+
+DATA unqEscape<>+32(SB)/8, $0x0000000000220000
+DATA unqEscape<>+40(SB)/8, $0x2F00000000000000
+DATA unqEscape<>+88(SB)/8, $0x0000005C00000000
+DATA unqEscape<>+96(SB)/8, $0x000C000000080000
+DATA unqEscape<>+104(SB)/8, $0x000A000000000000
+DATA unqEscape<>+112(SB)/8, $0x00008009000D0000
+GLOBL unqEscape<>(SB), (NOPTR+RODATA), $256
+
+DATA unqHex<>+0(SB)/8, $0xFFFFFFFFFFFFFFFF
+DATA unqHex<>+8(SB)/8, $0xFFFFFFFFFFFFFFFF
+DATA unqHex<>+16(SB)/8, $0xFFFFFFFFFFFFFFFF
+DATA unqHex<>+24(SB)/8, $0xFFFFFFFFFFFFFFFF
+DATA unqHex<>+32(SB)/8, $0xFFFFFFFFFFFFFFFF
+DATA unqHex<>+40(SB)/8, $0xFFFFFFFFFFFFFFFF
+DATA unqHex<>+48(SB)/8, $0x0706050403020100
+DATA unqHex<>+56(SB)/8, $0xFFFFFFFFFFFF0908
+DATA unqHex<>+64(SB)/8, $0xFF0F0E0D0C0B0AFF
+DATA unqHex<>+72(SB)/8, $0xFFFFFFFFFFFFFFFF
+DATA unqHex<>+80(SB)/8, $0xFFFFFFFFFFFFFFFF
+DATA unqHex<>+88(SB)/8, $0xFFFFFFFFFFFFFFFF
+DATA unqHex<>+96(SB)/8, $0xFF0F0E0D0C0B0AFF
+DATA unqHex<>+104(SB)/8, $0xFFFFFFFFFFFFFFFF
+DATA unqHex<>+112(SB)/8, $0xFFFFFFFFFFFFFFFF
+DATA unqHex<>+120(SB)/8, $0xFFFFFFFFFFFFFFFF
+DATA unqHex<>+128(SB)/8, $0xFFFFFFFFFFFFFFFF
+DATA unqHex<>+136(SB)/8, $0xFFFFFFFFFFFFFFFF
+DATA unqHex<>+144(SB)/8, $0xFFFFFFFFFFFFFFFF
+DATA unqHex<>+152(SB)/8, $0xFFFFFFFFFFFFFFFF
+DATA unqHex<>+160(SB)/8, $0xFFFFFFFFFFFFFFFF
+DATA unqHex<>+168(SB)/8, $0xFFFFFFFFFFFFFFFF
+DATA unqHex<>+176(SB)/8, $0xFFFFFFFFFFFFFFFF
+DATA unqHex<>+184(SB)/8, $0xFFFFFFFFFFFFFFFF
+DATA unqHex<>+192(SB)/8, $0xFFFFFFFFFFFFFFFF
+DATA unqHex<>+200(SB)/8, $0xFFFFFFFFFFFFFFFF
+DATA unqHex<>+208(SB)/8, $0xFFFFFFFFFFFFFFFF
+DATA unqHex<>+216(SB)/8, $0xFFFFFFFFFFFFFFFF
+DATA unqHex<>+224(SB)/8, $0xFFFFFFFFFFFFFFFF
+DATA unqHex<>+232(SB)/8, $0xFFFFFFFFFFFFFFFF
+DATA unqHex<>+240(SB)/8, $0xFFFFFFFFFFFFFFFF
+DATA unqHex<>+248(SB)/8, $0xFFFFFFFFFFFFFFFF
+GLOBL unqHex<>(SB), (NOPTR+RODATA), $256
+
+TEXT ·unquoteAVX2(SB), NOSPLIT, $0-56
+	MOVQ    dst+0(FP), DI
+	MOVQ    dstFree+8(FP), DX
+	MOVQ    src+16(FP), SI
+	MOVQ    srcLen+24(FP), CX
+	LEAQ    -64(DI)(DX*1), DX
+	LEAQ    -64(SI)(CX*1), CX
+	VMOVDQU unqQuote<>(SB), Y1
+	VMOVDQU unqBslash<>(SB), Y2
+	VMOVDQU unqCtrlMax<>(SB), Y3
+	LEAQ    unqEscape<>(SB), R12
+	LEAQ    unqHex<>(SB), R13
+
+loop:
+	CMPQ      SI, CX
+	JHI       stop
+	CMPQ      DI, DX
+	JHI       stop
+	VMOVDQU   (SI), Y0
+	VMOVDQU   Y0, (DI)
+	VPCMPEQB  Y1, Y0, Y4
+	VPCMPEQB  Y2, Y0, Y5
+	VPMAXUB   Y3, Y0, Y6
+	VPCMPEQB  Y3, Y6, Y6
+	VPOR      Y5, Y4, Y4
+	VPOR      Y6, Y4, Y4
+	VPMOVMSKB Y4, BX
+	TESTL     BX, BX
+	JNZ       special
+	ADDQ      $32, SI
+	ADDQ      $32, DI
+	JMP       loop
+
+special:
+	BSFL    BX, BX
+	ADDQ    BX, SI
+	ADDQ    BX, DI
+	MOVBLZX (SI), BX
+	CMPL    BX, $0x5C
+	JNE     notEscape
+	MOVBLZX 1(SI), BX
+	MOVBLZX (R12)(BX*1), R8
+	TESTL   R8, R8
+	JZ      stop
+	CMPL    R8, $0x80
+	JEQ     unicode
+	MOVB    R8, (DI)
+	INCQ    DI
+	ADDQ    $2, SI
+	JMP     loop
+
+unicode:
+	MOVBLZX 2(SI), R8
+	MOVBLZX (R13)(R8*1), R8
+	MOVBLZX 3(SI), R9
+	MOVBLZX (R13)(R9*1), R9
+	MOVBLZX 4(SI), R10
+	MOVBLZX (R13)(R10*1), R10
+	MOVBLZX 5(SI), BX
+	MOVBLZX (R13)(BX*1), BX
+	MOVL    R8, AX
+	ORL     R9, AX
+	ORL     R10, AX
+	ORL     BX, AX
+	TESTL   $0xF0, AX
+	JNZ     stop
+	SHLL    $12, R8
+	SHLL    $8, R9
+	SHLL    $4, R10
+	ORL     R9, R8
+	ORL     R10, R8
+	ORL     BX, R8
+	CMPL    R8, $0x80
+	JCS     ascii
+	CMPL    R8, $0x800
+	JCS     twoBytes
+	MOVL    R8, AX
+	SUBL    $0xD800, AX
+	CMPL    AX, $0x800
+	JCS     stop
+	MOVL    R8, AX
+	SHRL    $12, AX
+	ORL     $0xE0, AX
+	MOVL    R8, BX
+	SHRL    $6, BX
+	ANDL    $0x3F, BX
+	ORL     $0x80, BX
+	SHLL    $8, BX
+	ORL     BX, AX
+	ANDL    $0x3F, R8
+	ORL     $0x80, R8
+	SHLL    $16, R8
+	ORL     R8, AX
+	MOVL    AX, (DI)
+	ADDQ    $3, DI
+	ADDQ    $6, SI
+	JMP     loop
+
+twoBytes:
+	MOVL R8, AX
+	SHRL $6, AX
+	ORL  $0xC0, AX
+	ANDL $0x3F, R8
+	ORL  $0x80, R8
+	SHLL $8, R8
+	ORL  R8, AX
+	MOVW AX, (DI)
+	ADDQ $2, DI
+	ADDQ $6, SI
+	JMP  loop
+
+ascii:
+	MOVB R8, (DI)
+	INCQ DI
+	ADDQ $6, SI
+	JMP  loop
+
+notEscape:
+	CMPL BX, $0x22
+	JNE  stop
+	MOVQ $1, AX
+	JMP  finish
+
+stop:
+	XORL AX, AX
+
+finish:
+	VZEROUPPER
+	SUBQ dst+0(FP), DI
+	MOVQ DI, written+32(FP)
+	SUBQ src+16(FP), SI
+	MOVQ SI, consumed+40(FP)
+	MOVQ AX, closed+48(FP)
+	RET

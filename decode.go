@@ -1,8 +1,11 @@
 package json
 
 import (
+	"bytes"
 	"encoding"
 	"encoding/base64"
+	"encoding/binary"
+	"math/bits"
 	"reflect"
 	"strconv"
 	"sync"
@@ -18,6 +21,8 @@ const (
 	stringArenaChunk     = 4096
 	stringArenaMaxInline = 1024
 	initialSliceCap      = 4
+	smallStringCopy      = 16
+	countAheadMinLen     = 64
 )
 
 type decodeFunc func(d *decodeState, p unsafe.Pointer) error
@@ -25,6 +30,7 @@ type decodeFunc func(d *decodeState, p unsafe.Pointer) error
 type typeDecoder struct {
 	fn     decodeFunc
 	zero   func(p unsafe.Pointer)
+	rtype  unsafe.Pointer
 	custom bool
 }
 
@@ -47,6 +53,7 @@ type decodeState struct {
 var decodeStatePool = sync.Pool{New: func() any { return new(decodeState) }}
 
 type decoderCache struct {
+	slots        [typeSlotCount]atomic.Pointer[typeDecoder]
 	types        sync.Map
 	mu           sync.Mutex
 	unmarshalers *Unmarshalers
@@ -55,6 +62,17 @@ type decoderCache struct {
 var defaultDecoders decoderCache
 
 func (c *decoderCache) decoderFor(t reflect.Type) *typeDecoder {
+	rtype := typePointer(t)
+	slot := &c.slots[typeSlotIndex(rtype)]
+	if td := slot.Load(); td != nil && td.rtype == rtype {
+		return td
+	}
+	td := c.loadOrBuild(t)
+	slot.Store(td)
+	return td
+}
+
+func (c *decoderCache) loadOrBuild(t reflect.Type) *typeDecoder {
 	if v, ok := c.types.Load(t); ok {
 		return v.(*typeDecoder)
 	}
@@ -84,7 +102,7 @@ func (b *decoderBuilder) build(t reflect.Type) *typeDecoder {
 	if td, ok := b.building[t]; ok {
 		return td
 	}
-	td := &typeDecoder{zero: zeroFuncFor(t)}
+	td := &typeDecoder{zero: zeroFuncFor(t), rtype: typePointer(t)}
 	b.building[t] = td
 	td.fn = makeDecodeFunc(t, b)
 	if fns := b.cache.unmarshalers.applicable(t); len(fns) > 0 {
@@ -240,6 +258,10 @@ func (d *decodeState) skipSpace() {
 	d.pos = pos
 }
 
+func (d *decodeState) atValueStart() bool {
+	return d.pos < len(d.buf) && d.buf[d.pos] > ' '
+}
+
 func (d *decodeState) nextValueStart() error {
 	d.skipSpace()
 	if d.pos >= len(d.buf) {
@@ -278,6 +300,14 @@ func (d *decodeState) enter() error {
 }
 
 func (d *decodeState) afterElement(closer byte) (bool, error) {
+	if pos := d.pos; pos+1 < len(d.buf) && d.buf[pos] == ',' && d.buf[pos+1] > ' ' {
+		d.pos = pos + 1
+		return true, nil
+	}
+	return d.afterElementSlow(closer)
+}
+
+func (d *decodeState) afterElementSlow(closer byte) (bool, error) {
 	d.skipSpace()
 	if d.pos >= len(d.buf) {
 		return false, d.syntaxError("unexpected end of input")
@@ -338,12 +368,41 @@ func (d *decodeState) ownString(b []byte) string {
 	return unsafe.String(&d.arena[start], len(b))
 }
 
+func (d *decodeState) ownSmallInput(start, n int) string {
+	d.arenaReserve(smallStringCopy)
+	at := len(d.arena)
+	*(*[smallStringCopy]byte)(d.arena[at : at+smallStringCopy]) = *(*[smallStringCopy]byte)(d.buf[start : start+smallStringCopy])
+	d.arena = d.arena[:at+n]
+	return unsafe.String(&d.arena[at], n)
+}
+
+func shortWindowSpecial(b []byte, start int) int {
+	if start+smallStringCopy > len(b) {
+		return -1
+	}
+	end := start + bits.TrailingZeros64(scan.SpecialMask(binary.LittleEndian.Uint64(b[start:])))>>3
+	if end == start+wordLen {
+		end += bits.TrailingZeros64(scan.SpecialMask(binary.LittleEndian.Uint64(b[end:]))) >> 3
+		if end == start+smallStringCopy {
+			return -1
+		}
+	}
+	return end
+}
+
 func (d *decodeState) readString() (string, error) {
 	start, special, plain := d.plainStringEnd()
 	if plain {
 		d.pos = special + 1
+		if n := special - start; n > 0 && n <= smallStringCopy && start+smallStringCopy <= len(d.buf) {
+			return d.ownSmallInput(start, n), nil
+		}
 		return d.ownString(d.buf[start:special]), nil
 	}
+	return d.escapedString(start, special)
+}
+
+func (d *decodeState) escapedString(start, special int) (string, error) {
 	out, err := d.unquoteInto(d.strBuf, start, special)
 	if err != nil {
 		d.strBuf = out
@@ -577,6 +636,11 @@ func floatError(t reflect.Type, s string, quoted bool) error {
 
 func decodeFloat64(t reflect.Type) decodeFunc {
 	return func(d *decodeState, p unsafe.Pointer) error {
+		if f, end, ok := fnum.ScanFloat64(d.buf, d.pos); ok {
+			d.pos = end
+			*(*float64)(p) = f
+			return nil
+		}
 		s, quoted, err := d.floatText(t)
 		if err != nil {
 			return err
@@ -780,6 +844,26 @@ func storeSliceElem[T any](s []T, n int, v T) []T {
 	return s
 }
 
+func storeCountedSliceElem[T any](s []T, n int, v T, buf []byte, i int) []T {
+	if n == len(s) {
+		s = growCountedSlice(s, buf, i)
+	}
+	s[n] = v
+	return s
+}
+
+func growCountedSlice[T any](s []T, buf []byte, i int) []T {
+	size := max(initialSliceCap, 2*len(s))
+	if len(s) >= countAheadMinLen {
+		if end := bytes.IndexByte(buf[i:], ']'); end >= 0 {
+			size = len(s) + 1 + bytes.Count(buf[i:i+end], []byte{','})
+		}
+	}
+	grown := make([]T, size)
+	copy(grown, s)
+	return grown
+}
+
 func commitFastSlice[T any](d *decodeState, hdr *sliceHeader, s []T, n, next int) {
 	*hdr = sliceHeader{data: unsafe.Pointer(unsafe.SliceData(s)), len: n, cap: len(s)}
 	d.pos = next
@@ -823,7 +907,7 @@ func float64SliceDecoder(generic decodeFunc) decodeFunc {
 	}
 }
 
-func parseFastFloat64(b []byte, i int) (float64, int, bool) {
+func parseFloat64Text(b []byte, i int) (float64, int, bool) {
 	if !isNumberStart(b[i]) {
 		return 0, i, false
 	}
@@ -846,11 +930,13 @@ func fillFloat64Slice(d *decodeState, hdr *sliceHeader) bool {
 	}
 	s := unsafe.Slice((*float64)(hdr.data), hdr.cap)
 	for n := 1; ; n++ {
-		v, end, ok := parseFastFloat64(d.buf, i)
+		v, end, ok := fnum.ScanFloat64(d.buf, i)
 		if !ok {
-			return false
+			if v, end, ok = parseFloat64Text(d.buf, i); !ok {
+				return false
+			}
 		}
-		s = storeSliceElem(s, n-1, v)
+		s = storeCountedSliceElem(s, n-1, v, d.buf, i)
 		if next, ok := tightComma(d.buf, end); ok {
 			i = next
 			continue
@@ -889,8 +975,21 @@ func fillStringSlice(d *decodeState, hdr *sliceHeader) bool {
 			d.pos = start
 			return false
 		}
-		d.pos = i
-		v, err := d.readString()
+		var v string
+		var err error
+		from := i + 1
+		special := shortWindowSpecial(d.buf, from)
+		switch {
+		case special > from && d.buf[special] == '"':
+			d.pos = special + 1
+			v = d.ownSmallInput(from, special-from)
+		case special > from:
+			d.pos = i
+			v, err = d.escapedString(from, special)
+		default:
+			d.pos = i
+			v, err = d.readString()
+		}
 		if err != nil {
 			d.pos = start
 			return false
@@ -1050,9 +1149,38 @@ func (d *decodeState) allocPointer(id int, arrayType reflect.Type, size uintptr,
 
 type fieldDecoder struct {
 	name   string
-	quoted string
+	quoted quotedName
 	td     *typeDecoder
 	fieldLocation
+}
+
+const quotedNameWordLen = 16
+
+type quotedName struct {
+	literal string
+	words   [2]uint64
+	masks   [2]uint64
+	short   bool
+}
+
+func newQuotedName(literal string) quotedName {
+	q := quotedName{literal: literal, short: literal != "" && len(literal) <= quotedNameWordLen}
+	var padded [quotedNameWordLen]byte
+	copy(padded[:], literal)
+	for i := range q.words {
+		q.words[i] = binary.LittleEndian.Uint64(padded[i*8:])
+		for j := i * 8; j < min(len(literal), (i+1)*8); j++ {
+			q.masks[i] |= 0xff << (8 * (j - i*8))
+		}
+	}
+	return q
+}
+
+func (q *quotedName) prefixOf(b []byte) bool {
+	if q.short && len(b) >= quotedNameWordLen {
+		return binary.LittleEndian.Uint64(b)&q.masks[0] == q.words[0] && binary.LittleEndian.Uint64(b[8:])&q.masks[1] == q.words[1]
+	}
+	return hasPrefix(b, q.literal)
 }
 
 func decodeStruct(t reflect.Type, b *decoderBuilder) decodeFunc {
@@ -1063,7 +1191,7 @@ func decodeStruct(t reflect.Type, b *decoderBuilder) decodeFunc {
 		fields[i] = fieldDecoder{
 			fieldLocation: sf.fieldLocation,
 			name:          sf.name,
-			quoted:        literalQuotedName(sf.name),
+			quoted:        newQuotedName(quotedMemberPrefix(sf.name)),
 			td:            b.build(sf.typ),
 		}
 	}
@@ -1077,8 +1205,10 @@ func decodeStruct(t reflect.Type, b *decoderBuilder) decodeFunc {
 		if err := d.enter(); err != nil {
 			return err
 		}
-		if err := d.nextValueStart(); err != nil {
-			return err
+		if !d.atValueStart() {
+			if err := d.nextValueStart(); err != nil {
+				return err
+			}
 		}
 		if d.buf[d.pos] == '}' {
 			d.pos++
@@ -1089,12 +1219,14 @@ func decodeStruct(t reflect.Type, b *decoderBuilder) decodeFunc {
 		for {
 			var f *fieldDecoder
 			var key []byte
-			if next < len(fields) && hasPrefix(d.buf[d.pos:], fields[next].quoted) {
+			if next < len(fields) && fields[next].quoted.prefixOf(d.buf[d.pos:]) {
 				f = &fields[next]
 				next++
-				d.pos += len(f.quoted)
-				if err := d.colon(); err != nil {
-					return err
+				d.pos += len(f.quoted.literal)
+				if !d.atValueStart() {
+					if err := d.nextValueStart(); err != nil {
+						return err
+					}
 				}
 			} else {
 				var err error
@@ -1138,12 +1270,27 @@ func (d *decodeState) objectKey() ([]byte, error) {
 }
 
 func (d *decodeState) colon() error {
+	if pos := d.pos; pos+1 < len(d.buf) && d.buf[pos] == ':' && d.buf[pos+1] > ' ' {
+		d.pos = pos + 1
+		return nil
+	}
+	return d.colonSlow()
+}
+
+func (d *decodeState) colonSlow() error {
 	d.skipSpace()
 	if d.pos >= len(d.buf) || d.buf[d.pos] != ':' {
 		return d.syntaxError("missing ':' after object name")
 	}
 	d.pos++
 	return d.nextValueStart()
+}
+
+func quotedMemberPrefix(name string) string {
+	if quoted := literalQuotedName(name); quoted != "" {
+		return quoted + ":"
+	}
+	return ""
 }
 
 func literalQuotedName(name string) string {
@@ -1480,6 +1627,10 @@ func (d *decodeState) anyValue() (any, error) {
 	case 'n':
 		return nil, d.literal("null")
 	default:
+		if f, end, ok := fnum.ScanFloat64(d.buf, d.pos); ok {
+			d.pos = end
+			return boxInSlab(&d.floatSlab, float64EfaceType, f, floatSlabLen), nil
+		}
 		if !isNumberStart(c) {
 			return nil, d.syntaxError("unexpected character")
 		}

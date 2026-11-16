@@ -26,7 +26,7 @@ var allocDoc = []byte(`{"name":"alice","age":30,"email":"a@example.com","score":
 
 func TestAllocationBudgets(t *testing.T) {
 	if instrumentedBuild {
-		t.Skip("allocation counts are not meaningful under race or asan instrumentation")
+		t.Skip("allocation counts are not meaningful under race, asan or msan instrumentation")
 	}
 	var reused allocDocType
 	if err := alosjson.Unmarshal(allocDoc, &reused); err != nil {
