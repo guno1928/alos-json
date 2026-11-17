@@ -5,11 +5,26 @@ import (
 	"encoding/base64"
 	"reflect"
 	"sort"
+	"strconv"
 	"sync"
 	"unsafe"
 
+	"github.com/guno1928/alos-json/internal/scan"
 	"github.com/guno1928/alos-json/jsontext"
 )
+
+func mapKeyString(v reflect.Value) string {
+	switch v.Kind() {
+	case reflect.String:
+		return v.String()
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return strconv.FormatInt(v.Int(), 10)
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return strconv.FormatUint(v.Uint(), 10)
+	default:
+		return ""
+	}
+}
 
 type directEnc func(dst *[]byte, v reflect.Value, o *Options) error
 
@@ -207,11 +222,61 @@ func dNewArray(t reflect.Type) directEnc {
 	}
 }
 
+func referenceTextKey(t reflect.Type) bool {
+	return t.Kind() != reflect.String && t.Implements(reflect.TypeFor[encoding.TextMarshaler]())
+}
+
+func referenceMapKeySupported(t reflect.Type) bool {
+	switch t.Kind() {
+	case reflect.String, reflect.Bool, reflect.Float32, reflect.Float64,
+		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return true
+	}
+	return referenceTextKey(t)
+}
+
+func referenceMapKeyName(key reflect.Value) (string, error) {
+	t := key.Type()
+	if referenceTextKey(t) {
+		if t.Kind() == reflect.Pointer && key.IsNil() {
+			return "", nil
+		}
+		b, err := key.Interface().(encoding.TextMarshaler).MarshalText()
+		return string(b), err
+	}
+	switch t.Kind() {
+	case reflect.Float32, reflect.Float64:
+		var b []byte
+		err := appendFloat(&b, key.Float(), t.Bits())
+		return string(b), err
+	case reflect.Bool:
+		return strconv.FormatBool(key.Bool()), nil
+	}
+	return mapKeyString(key), nil
+}
+
+func appendReferenceMapKey(dst *[]byte, key reflect.Value, escHTML bool) error {
+	name, err := referenceMapKeyName(key)
+	if err != nil {
+		return err
+	}
+	if escHTML {
+		*dst = jsontext.AppendQuoteStringHTML(*dst, name)
+	} else {
+		*dst = appendJStr(*dst, name)
+	}
+	return nil
+}
+
 func dNewMap(t reflect.Type) directEnc {
 	valEnc := cachedDirectEnc(t.Elem())
 	valIsIface := t.Elem().Kind() == reflect.Interface
-	keyIsString := t.Key().Kind() == reflect.String
+	keySupported := referenceMapKeySupported(t.Key())
 	return func(dst *[]byte, v reflect.Value, o *Options) error {
+		if !keySupported {
+			return &SemanticError{GoType: t.Key(), Msg: "unsupported map key type"}
+		}
 		if v.IsNil() {
 			if o.has(flagFormatNilMapAsNull) {
 				*dst = append(*dst, "null"...)
@@ -224,21 +289,26 @@ func dNewMap(t reflect.Type) directEnc {
 		escHTML := o.has(flagEscapeHTML)
 		if o.has(flagDeterministic) {
 			keys := v.MapKeys()
-			sort.Slice(keys, func(i, j int) bool {
-				return mapKeyString(keys[i]) < mapKeyString(keys[j])
-			})
+			names := make([]string, len(keys))
 			for i, key := range keys {
+				name, err := referenceMapKeyName(key)
+				if err != nil {
+					return err
+				}
+				names[i] = name
+			}
+			order := make([]int, len(keys))
+			for i := range order {
+				order[i] = i
+			}
+			sort.SliceStable(order, func(i, j int) bool { return names[order[i]] < names[order[j]] })
+			for i, idx := range order {
+				key := keys[idx]
 				if i > 0 {
 					*dst = append(*dst, ',')
 				}
-				if keyIsString {
-					if escHTML {
-						*dst = jsontext.AppendQuoteStringHTML(*dst, key.String())
-					} else {
-						*dst = appendJStr(*dst, key.String())
-					}
-				} else {
-					*dst = appendMapKeyStr(*dst, key)
+				if err := appendReferenceMapKey(dst, key, escHTML); err != nil {
+					return err
 				}
 				*dst = append(*dst, ':')
 				val := v.MapIndex(key)
@@ -261,14 +331,8 @@ func dNewMap(t reflect.Type) directEnc {
 				} else {
 					*dst = append(*dst, ',')
 				}
-				if keyIsString {
-					if escHTML {
-						*dst = jsontext.AppendQuoteStringHTML(*dst, iter.Key().String())
-					} else {
-						*dst = appendJStr(*dst, iter.Key().String())
-					}
-				} else {
-					*dst = appendMapKeyStr(*dst, iter.Key())
+				if err := appendReferenceMapKey(dst, iter.Key(), escHTML); err != nil {
+					return err
 				}
 				*dst = append(*dst, ':')
 				val := iter.Value()
@@ -1036,13 +1100,20 @@ func dAddrMarshalerTo(dst *[]byte, v reflect.Value, _ *Options) error {
 	return err
 }
 
+func appendReferenceMarshalerOutput(dst *[]byte, t reflect.Type, b []byte) error {
+	if !scan.Valid(b) {
+		return &SemanticError{GoType: t, Msg: "invalid MarshalJSON output"}
+	}
+	*dst = append(*dst, b...)
+	return nil
+}
+
 func dMarshaler(dst *[]byte, v reflect.Value, _ *Options) error {
 	b, err := v.Interface().(Marshaler).MarshalJSON()
 	if err != nil {
 		return err
 	}
-	*dst = append(*dst, b...)
-	return nil
+	return appendReferenceMarshalerOutput(dst, v.Type(), b)
 }
 
 func dAddrMarshaler(dst *[]byte, v reflect.Value, _ *Options) error {
@@ -1058,8 +1129,7 @@ func dAddrMarshaler(dst *[]byte, v reflect.Value, _ *Options) error {
 	if err != nil {
 		return err
 	}
-	*dst = append(*dst, b...)
-	return nil
+	return appendReferenceMarshalerOutput(dst, v.Type(), b)
 }
 
 func dTextMarshaler(dst *[]byte, v reflect.Value, o *Options) error {

@@ -121,6 +121,8 @@ func makeDecodeFunc(t reflect.Type, b *decoderBuilder) decodeFunc {
 		return decodeUnmarshaler(t)
 	case pt.Implements(textUnmarshalerType):
 		return decodeTextUnmarshaler(t, makeKindDecodeFunc(t, b))
+	case isStdNumberType(t):
+		return decodeStdNumber(t)
 	}
 	return makeKindDecodeFunc(t, b)
 }
@@ -1457,28 +1459,59 @@ func customMapKeyDecoder(t reflect.Type, b *decoderBuilder) func(d *decodeState,
 }
 
 func setMapKey(keyVal reflect.Value, keyType, mapType reflect.Type, key []byte, d *decodeState) error {
+	if keyType.Kind() == reflect.String {
+		keyVal.SetString(d.ownString(key))
+		return nil
+	}
+	return setMapKeyText(keyVal, keyType, string(key))
+}
+
+func setMapKeyText(keyVal reflect.Value, keyType reflect.Type, text string) error {
+	if reflect.PointerTo(keyType).Implements(textUnmarshalerType) {
+		keyVal.SetZero()
+		return keyVal.Addr().Interface().(encoding.TextUnmarshaler).UnmarshalText([]byte(text))
+	}
 	switch keyType.Kind() {
 	case reflect.String:
-		keyVal.SetString(d.ownString(key))
+		keyVal.SetString(text)
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		n, err := parseIntValue(string(key), keyType, false)
+		n, err := parseIntValue(text, keyType, false)
 		if err != nil {
 			return err
 		}
 		keyVal.SetInt(n)
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
-		n, err := parseUintValue(string(key), keyType, false)
+		n, err := parseUintValue(text, keyType, false)
 		if err != nil {
 			return err
 		}
 		keyVal.SetUint(n)
-	default:
-		keyVal.SetZero()
-		if u, ok := keyVal.Addr().Interface().(encoding.TextUnmarshaler); ok {
-			return u.UnmarshalText([]byte(string(key)))
+	case reflect.Float32, reflect.Float64:
+		if !isNumberText(text) {
+			return mapKeyParseError(keyType, text)
 		}
+		f, err := strconv.ParseFloat(text, keyType.Bits())
+		if err != nil {
+			return mapKeyParseError(keyType, text)
+		}
+		keyVal.SetFloat(f)
+	case reflect.Bool:
+		switch text {
+		case "true":
+			keyVal.SetBool(true)
+		case "false":
+			keyVal.SetBool(false)
+		default:
+			return mapKeyParseError(keyType, text)
+		}
+	default:
+		return newSemanticError(keyType, "unsupported map key type")
 	}
 	return nil
+}
+
+func mapKeyParseError(keyType reflect.Type, text string) error {
+	return newSemanticError(keyType, "cannot parse map key "+strconv.Quote(text)+" as "+keyType.String())
 }
 
 func decodeNativeMap[V any](t reflect.Type, elem *typeDecoder) decodeFunc {

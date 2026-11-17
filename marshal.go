@@ -55,7 +55,8 @@ func hasCustomMarshaler(t reflect.Type) bool {
 	pt := reflect.PointerTo(t)
 	return t.Implements(marshalerToType) || pt.Implements(marshalerToType) ||
 		t.Implements(marshalerType) || pt.Implements(marshalerType) ||
-		t.Implements(textMarshalerType) || pt.Implements(textMarshalerType)
+		t.Implements(textMarshalerType) || pt.Implements(textMarshalerType) ||
+		isStdNumberType(t)
 }
 
 type eface struct {
@@ -231,19 +232,6 @@ const hexDigitsMarshal = "0123456789abcdef"
 
 func hx(c byte) byte {
 	return hexDigitsMarshal[c]
-}
-
-func mapKeyString(v reflect.Value) string {
-	switch v.Kind() {
-	case reflect.String:
-		return v.String()
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		return strconv.FormatInt(v.Int(), 10)
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
-		return strconv.FormatUint(v.Uint(), 10)
-	default:
-		return ""
-	}
 }
 
 func appendMapKeyStr(dst []byte, v reflect.Value) []byte {

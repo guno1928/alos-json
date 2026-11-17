@@ -14,8 +14,9 @@ import (
 var SkipFunc = errors.New("json: skip function")
 
 var (
-	errSkipMutation     = errors.New("must not read or write any tokens when skipping")
-	errNonSingularValue = errors.New("must read or write exactly one value")
+	errSkipMutation           = errors.New("must not read or write any tokens when skipping")
+	errNonSingularValue       = errors.New("must read or write exactly one value")
+	errInvalidMarshalerOutput = errors.New("MarshalJSON returned invalid JSON")
 )
 
 type marshalFn func(e *encodeState, b []byte, from reflect.Type, p unsafe.Pointer) ([]byte, error)

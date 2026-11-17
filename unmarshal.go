@@ -56,6 +56,9 @@ func buildDirectDec(t reflect.Type) directDec {
 	if pt.Implements(textUnmarshalerType) {
 		return decTextUnmarshaler
 	}
+	if isStdNumberType(t) {
+		return decStdNumber
+	}
 
 	switch t.Kind() {
 	case reflect.Bool:
@@ -770,27 +773,8 @@ func unmarshalMap(dec *jsontext.Decoder, v reflect.Value, o *Options) error {
 			keyVal.SetString(tok.Str())
 		} else {
 			keyVal = reflect.New(keyType).Elem()
-			switch keyType.Kind() {
-			case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-				n, err := parseIntValue(tok.Str(), keyType, false)
-				if err != nil {
-					return err
-				}
-				keyVal.SetInt(n)
-			case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
-				n, err := parseUintValue(tok.Str(), keyType, false)
-				if err != nil {
-					return err
-				}
-				keyVal.SetUint(n)
-			default:
-				if keyVal.CanAddr() {
-					if u, ok := keyVal.Addr().Interface().(encoding.TextUnmarshaler); ok {
-						if err := u.UnmarshalText([]byte(tok.Str())); err != nil {
-							return err
-						}
-					}
-				}
+			if err := setMapKeyText(keyVal, keyType, tok.Str()); err != nil {
+				return err
 			}
 		}
 
@@ -961,8 +945,11 @@ func fieldByIndexAlloc(v reflect.Value, index []int) reflect.Value {
 	for _, i := range index {
 		if v.Kind() == reflect.Pointer {
 			if v.IsNil() {
-				if !v.CanSet() {
+				if !v.CanAddr() {
 					return reflect.Value{}
+				}
+				if !v.CanSet() {
+					v = reflect.NewAt(v.Type(), unsafe.Pointer(v.UnsafeAddr())).Elem()
 				}
 				v.Set(reflect.New(v.Type().Elem()))
 			}

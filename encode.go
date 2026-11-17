@@ -12,6 +12,7 @@ import (
 	"unsafe"
 
 	"github.com/guno1928/alos-json/internal/fnum"
+	"github.com/guno1928/alos-json/internal/scan"
 	"github.com/guno1928/alos-json/jsontext"
 )
 
@@ -155,6 +156,8 @@ func makeMethodOrKindEncodeFunc(t reflect.Type, b *encoderBuilder) encodeFunc {
 		return encodeMarshaler(t)
 	case t.Implements(textMarshalerType) || pt.Implements(textMarshalerType):
 		return encodeTextMarshaler(t)
+	case isStdNumberType(t):
+		return encodeStdNumber(t)
 	}
 	fn := makeKindEncodeFunc(t, b)
 	if _, scalar := scalarEncoders[t.Kind()]; scalar && t.Kind() != reflect.Bool && b.has(flagStringifyNumbers) {
@@ -797,6 +800,10 @@ func encodeReflectMap(t reflect.Type, b *encoderBuilder) encodeFunc {
 	key, customKeys := defaultMapKeyEncoder(t.Key()), false
 	if fns := b.cache.marshalers.applicable(t.Key()); len(fns) > 0 {
 		key, customKeys = customMapKeyEncoder(t.Key(), fns), true
+	} else if _, err := mapKeyNamerFor(t.Key()); err != nil {
+		return func(_ *encodeState, b []byte, _ unsafe.Pointer) ([]byte, error) {
+			return b, err
+		}
 	}
 	members := mapMembersEncoder(t, b.build(t.Elem()), key, customKeys)
 	return func(e *encodeState, b []byte, p unsafe.Pointer) ([]byte, error) {
@@ -814,15 +821,71 @@ func encodeReflectMap(t reflect.Type, b *encoderBuilder) encodeFunc {
 
 type mapKeyEncoder func(e *encodeState, b []byte, key reflect.Value) ([]byte, error)
 
+type mapKeyNamer func(key reflect.Value) (string, error)
+
+func usesTextMarshalerKey(keyType reflect.Type) bool {
+	return keyType.Kind() != reflect.String && keyType.Implements(textMarshalerType)
+}
+
+func mapKeyNamerFor(keyType reflect.Type) (mapKeyNamer, error) {
+	if usesTextMarshalerKey(keyType) {
+		return textMarshalerKeyName, nil
+	}
+	switch keyType.Kind() {
+	case reflect.String:
+		return func(key reflect.Value) (string, error) { return key.String(), nil }, nil
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return func(key reflect.Value) (string, error) { return strconv.FormatInt(key.Int(), 10), nil }, nil
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return func(key reflect.Value) (string, error) { return strconv.FormatUint(key.Uint(), 10), nil }, nil
+	case reflect.Float32, reflect.Float64:
+		bits := keyType.Bits()
+		return func(key reflect.Value) (string, error) {
+			var out []byte
+			err := appendFloat(&out, key.Float(), bits)
+			return string(out), err
+		}, nil
+	case reflect.Bool:
+		return func(key reflect.Value) (string, error) { return strconv.FormatBool(key.Bool()), nil }, nil
+	}
+	return nil, newSemanticError(keyType, "unsupported map key type")
+}
+
+func textMarshalerKeyName(key reflect.Value) (string, error) {
+	if key.Kind() == reflect.Pointer && key.IsNil() {
+		return "", nil
+	}
+	out, err := key.Interface().(encoding.TextMarshaler).MarshalText()
+	return string(out), err
+}
+
 func defaultMapKeyEncoder(keyType reflect.Type) mapKeyEncoder {
-	if keyType.Kind() == reflect.String {
+	name, err := mapKeyNamerFor(keyType)
+	switch {
+	case err != nil:
+		return func(_ *encodeState, b []byte, _ reflect.Value) ([]byte, error) {
+			return b, err
+		}
+	case keyType.Kind() == reflect.String:
 		return func(e *encodeState, b []byte, key reflect.Value) ([]byte, error) {
 			return e.appendString(b, key.String()), nil
 		}
+	case isIntegerKind(keyType.Kind()) && !usesTextMarshalerKey(keyType):
+		return func(_ *encodeState, b []byte, key reflect.Value) ([]byte, error) {
+			return appendMapKeyStr(b, key), nil
+		}
 	}
-	return func(_ *encodeState, b []byte, key reflect.Value) ([]byte, error) {
-		return appendMapKeyStr(b, key), nil
+	return func(e *encodeState, b []byte, key reflect.Value) ([]byte, error) {
+		s, err := name(key)
+		if err != nil {
+			return b, err
+		}
+		return e.appendString(b, s), nil
 	}
+}
+
+func isIntegerKind(k reflect.Kind) bool {
+	return k >= reflect.Int && k <= reflect.Uintptr
 }
 
 func customMapKeyEncoder(keyType reflect.Type, fns []typedFunc[marshalFn]) mapKeyEncoder {
@@ -855,6 +918,7 @@ type mapMembersFunc func(e *encodeState, b []byte, m reflect.Value, first bool, 
 
 func mapMembersEncoder(t reflect.Type, elem *typeEncoder, key mapKeyEncoder, customKeys bool) mapMembersFunc {
 	keyType, elemType := t.Key(), t.Elem()
+	keyName, _ := mapKeyNamerFor(keyType)
 	return func(e *encodeState, b []byte, m reflect.Value, first bool, checkName func(string) error) ([]byte, error) {
 		keyVal := reflect.New(keyType).Elem()
 		elemVal := reflect.New(elemType).Elem()
@@ -899,7 +963,9 @@ func mapMembersEncoder(t reflect.Type, elem *typeEncoder, key mapKeyEncoder, cus
 		}
 		for i := range keys {
 			if !customKeys {
-				names[i] = mapKeyString(keys[i])
+				if names[i], err = keyName(keys[i]); err != nil {
+					return b, err
+				}
 				continue
 			}
 			keyVal.Set(keys[i])
@@ -1197,6 +1263,9 @@ func (e *encodeState) quotedScalar(b []byte, t reflect.Type, te *typeEncoder, p 
 		te = e.encoders.encoderFor(t)
 	}
 	scalar, ok := scalarEncoders[t.Kind()]
+	if !ok && isStdNumberType(t) {
+		scalar, ok = te.fn, true
+	}
 	if te.custom || !ok {
 		return te.fn(e, b, p)
 	}
@@ -1236,6 +1305,9 @@ func encodeMarshaler(t reflect.Type) encodeFunc {
 		out, err := methodValue(t, p, marshalerType).(Marshaler).MarshalJSON()
 		if err != nil {
 			return b, err
+		}
+		if !scan.Valid(out) {
+			return b, &SemanticError{GoType: t, Err: errInvalidMarshalerOutput}
 		}
 		return append(b, out...), nil
 	}

@@ -166,6 +166,9 @@ func appendIndent(dst []byte, prefix, indent string, depth int) []byte {
 }
 
 func (v Value) MarshalJSON() ([]byte, error) {
+	if v == nil {
+		return []byte("null"), nil
+	}
 	return bytes.Clone([]byte(v)), nil
 }
 

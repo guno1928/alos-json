@@ -126,7 +126,7 @@ func isInlineFallbackType(t reflect.Type) bool {
 
 func hasCustomUnmarshaler(t reflect.Type) bool {
 	pt := reflect.PointerTo(t)
-	return pt.Implements(unmarshalerFromType) || pt.Implements(unmarshalerType) || pt.Implements(textUnmarshalerType)
+	return pt.Implements(unmarshalerFromType) || pt.Implements(unmarshalerType) || pt.Implements(textUnmarshalerType) || isStdNumberType(t)
 }
 
 func collectFields(out *[]structField, fallbacks *[]inlineFallback, t reflect.Type, index []int, visiting map[reflect.Type]bool) {
@@ -148,12 +148,11 @@ func collectFields(out *[]structField, fallbacks *[]inlineFallback, t reflect.Ty
 		}
 		if f.Anonymous || inline {
 			ft := f.Type
-			isPtr := ft.Kind() == reflect.Pointer
-			if isPtr {
+			if ft.Kind() == reflect.Pointer {
 				ft = ft.Elem()
 			}
 			if ft.Kind() == reflect.Struct && (inline || name == "") {
-				if (!f.IsExported() && (isPtr || !f.Anonymous)) || visiting[ft] {
+				if (!f.IsExported() && !f.Anonymous) || visiting[ft] {
 					continue
 				}
 				visiting[ft] = true
