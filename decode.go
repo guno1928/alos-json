@@ -48,6 +48,8 @@ type decodeState struct {
 	sliceSlab  [][]any
 
 	pointerSlabs []pointerSlab
+
+	sizeHintBudget int
 }
 
 var decodeStatePool = sync.Pool{New: func() any { return new(decodeState) }}
@@ -203,6 +205,20 @@ func zeroFuncFor(t reflect.Type) func(p unsafe.Pointer) {
 	}
 }
 
+func singleWordZeroFor(t reflect.Type) func(p unsafe.Pointer) {
+	switch t.Kind() {
+	case reflect.String:
+		return func(p unsafe.Pointer) { *(*string)(p) = "" }
+	case reflect.Slice:
+		return func(p unsafe.Pointer) { *(*[]byte)(p) = nil }
+	case reflect.Interface:
+		return func(p unsafe.Pointer) { *(*any)(p) = nil }
+	case reflect.Pointer, reflect.Map, reflect.Chan, reflect.Func, reflect.UnsafePointer:
+		return func(p unsafe.Pointer) { *(*unsafe.Pointer)(p) = nil }
+	}
+	return nil
+}
+
 func unmarshalBytesFast(data []byte, v any, opts []Option) error {
 	rv := reflect.ValueOf(v)
 	if rv.Kind() != reflect.Pointer || rv.IsNil() {
@@ -210,6 +226,7 @@ func unmarshalBytesFast(data []byte, v any, opts []Option) error {
 	}
 	d := decodeStatePool.Get().(*decodeState)
 	d.buf = data
+	d.sizeHintBudget = len(data)
 	d.pos = 0
 	d.depth = 0
 	d.opts = Options{}
@@ -1361,6 +1378,8 @@ func (d *decodeState) inlineMember(t reflect.Type, p unsafe.Pointer, fallback *i
 var (
 	stringType   = reflect.TypeFor[string]()
 	intType      = reflect.TypeFor[int]()
+	int64Type    = reflect.TypeFor[int64]()
+	uint64Type   = reflect.TypeFor[uint64]()
 	boolType     = reflect.TypeFor[bool]()
 	sliceAnyType = reflect.TypeFor[[]any]()
 )
@@ -1369,17 +1388,21 @@ func decodeMap(t reflect.Type, b *decoderBuilder) decodeFunc {
 	if t == mapStringAnyType && !b.customized() {
 		return decodeMapStringAny
 	}
-	if t.Key() == stringType && !b.customized() {
-		switch t.Elem() {
-		case stringType:
-			return decodeNativeMap[string](t, b.build(stringType))
-		case intType:
-			return decodeNativeMap[int](t, b.build(intType))
+	if !b.customized() {
+		if fn := nativeMapDecoder(t, b); fn != nil {
+			return fn
 		}
 	}
 	keyType, elemType := t.Key(), t.Elem()
 	elem := b.build(elemType)
 	customKey := customMapKeyDecoder(t, b)
+	keyParser := newMapKeyParser(keyType)
+	insert := linkedMapInserter(t)
+	resize := linkedMapResizer(t)
+	zeroElem := elem.zero
+	if z := singleWordZeroFor(elemType); z != nil {
+		zeroElem = z
+	}
 	return func(d *decodeState, p unsafe.Pointer) error {
 		if d.buf[d.pos] != '{' {
 			return newSemanticError(t, "expected object")
@@ -1388,7 +1411,8 @@ func decodeMap(t reflect.Type, b *decoderBuilder) decodeFunc {
 			return err
 		}
 		m := reflect.NewAt(t, p).Elem()
-		if m.IsNil() {
+		fresh := m.IsNil()
+		if fresh {
 			m.Set(reflect.MakeMap(t))
 		}
 		if err := d.nextValueStart(); err != nil {
@@ -1401,8 +1425,13 @@ func decodeMap(t reflect.Type, b *decoderBuilder) decodeFunc {
 		}
 		keyVal := reflect.New(keyType).Elem()
 		elemVal := reflect.New(elemType).Elem()
-		elemPtr := elemVal.Addr().UnsafePointer()
-		for {
+		keyPtr, elemPtr := keyVal.Addr().UnsafePointer(), elemVal.Addr().UnsafePointer()
+		for decoded := 0; ; decoded++ {
+			if fresh && decoded == presizeAfterEntries && resize != nil {
+				if rest := d.objectSizeHint(); rest > 0 {
+					resize(p, decoded+rest)
+				}
+			}
 			if customKey != nil {
 				if err := customKey(d, keyVal); err != nil {
 					return err
@@ -1412,15 +1441,19 @@ func decodeMap(t reflect.Type, b *decoderBuilder) decodeFunc {
 				if err != nil {
 					return err
 				}
-				if err := setMapKey(keyVal, keyType, t, key, d); err != nil {
+				if err := keyParser.set(keyVal, key, d); err != nil {
 					return err
 				}
 			}
-			elem.zero(elemPtr)
+			zeroElem(elemPtr)
 			if err := d.value(elem, elemPtr); err != nil {
 				return err
 			}
-			m.SetMapIndex(keyVal, elemVal)
+			if insert != nil {
+				insert(*(*unsafe.Pointer)(p), keyPtr, elemPtr)
+			} else {
+				m.SetMapIndex(keyVal, elemVal)
+			}
 			more, err := d.afterElement('}')
 			if err != nil {
 				return err
@@ -1458,19 +1491,72 @@ func customMapKeyDecoder(t reflect.Type, b *decoderBuilder) func(d *decodeState,
 	}
 }
 
-func setMapKey(keyVal reflect.Value, keyType, mapType reflect.Type, key []byte, d *decodeState) error {
-	if keyType.Kind() == reflect.String {
+type mapKeyParser struct {
+	keyType  reflect.Type
+	isString bool
+	viaText  bool
+}
+
+func newMapKeyParser(keyType reflect.Type) mapKeyParser {
+	return mapKeyParser{
+		keyType:  keyType,
+		isString: keyType.Kind() == reflect.String,
+		viaText:  reflect.PointerTo(keyType).Implements(textUnmarshalerType),
+	}
+}
+
+func (k mapKeyParser) set(keyVal reflect.Value, key []byte, d *decodeState) error {
+	switch {
+	case k.isString:
 		keyVal.SetString(d.ownString(key))
 		return nil
+	case k.viaText:
+		return unmarshalTextKey(keyVal, b2s(key))
 	}
-	return setMapKeyText(keyVal, keyType, string(key))
+	return setMapKeyKind(keyVal, k.keyType, b2s(key))
+}
+
+type mapInserter func(m, key, elem unsafe.Pointer)
+
+const (
+	mapSizeHintBudget   = 32 << 10
+	presizeAfterEntries = 8
+)
+
+func resizedMap[K comparable, V any](m map[K]V, size int) map[K]V {
+	out := make(map[K]V, size)
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+func (d *decodeState) objectSizeHint() int {
+	if d.buf[d.pos] == '}' || d.sizeHintBudget <= 0 {
+		return 0
+	}
+	count, end := scan.ObjectMembers(d.buf, d.pos, min(mapSizeHintBudget, d.sizeHintBudget))
+	d.sizeHintBudget -= end - d.pos
+	return count
+}
+
+func setMapKey(keyVal reflect.Value, keyType, mapType reflect.Type, key []byte, d *decodeState) error {
+	return newMapKeyParser(keyType).set(keyVal, key, d)
 }
 
 func setMapKeyText(keyVal reflect.Value, keyType reflect.Type, text string) error {
 	if reflect.PointerTo(keyType).Implements(textUnmarshalerType) {
-		keyVal.SetZero()
-		return keyVal.Addr().Interface().(encoding.TextUnmarshaler).UnmarshalText([]byte(text))
+		return unmarshalTextKey(keyVal, text)
 	}
+	return setMapKeyKind(keyVal, keyType, text)
+}
+
+func unmarshalTextKey(keyVal reflect.Value, text string) error {
+	keyVal.SetZero()
+	return keyVal.Addr().Interface().(encoding.TextUnmarshaler).UnmarshalText([]byte(text))
+}
+
+func setMapKeyKind(keyVal reflect.Value, keyType reflect.Type, text string) error {
 	switch keyType.Kind() {
 	case reflect.String:
 		keyVal.SetString(text)
@@ -1514,7 +1600,56 @@ func mapKeyParseError(keyType reflect.Type, text string) error {
 	return newSemanticError(keyType, "cannot parse map key "+strconv.Quote(text)+" as "+keyType.String())
 }
 
-func decodeNativeMap[V any](t reflect.Type, elem *typeDecoder) decodeFunc {
+type nativeMapKeyParser[K comparable] func(d *decodeState, raw []byte) (K, error)
+
+func nativeMapDecoder(t reflect.Type, b *decoderBuilder) decodeFunc {
+	switch t.Key() {
+	case stringType:
+		return nativeMapDecoderFor(t, b, ownedMapKey)
+	case intType:
+		return nativeMapDecoderFor(t, b, signedMapKey[int](intType))
+	case int64Type:
+		return nativeMapDecoderFor(t, b, signedMapKey[int64](int64Type))
+	case uint64Type:
+		return nativeMapDecoderFor(t, b, unsignedMapKey(uint64Type))
+	}
+	return nil
+}
+
+func nativeMapDecoderFor[K comparable](t reflect.Type, b *decoderBuilder, parseKey nativeMapKeyParser[K]) decodeFunc {
+	switch t.Elem() {
+	case stringType:
+		return decodeNativeMap[K, string](t, b.build(stringType), parseKey)
+	case intType:
+		return decodeNativeMap[K, int](t, b.build(intType), parseKey)
+	case int64Type:
+		return decodeNativeMap[K, int64](t, b.build(int64Type), parseKey)
+	case float64Type:
+		return decodeNativeMap[K, float64](t, b.build(float64Type), parseKey)
+	case boolType:
+		return decodeNativeMap[K, bool](t, b.build(boolType), parseKey)
+	}
+	return nil
+}
+
+func ownedMapKey(d *decodeState, raw []byte) (string, error) {
+	return d.ownString(raw), nil
+}
+
+func signedMapKey[K int | int64](keyType reflect.Type) nativeMapKeyParser[K] {
+	return func(_ *decodeState, raw []byte) (K, error) {
+		n, err := parseIntValue(b2s(raw), keyType, false)
+		return K(n), err
+	}
+}
+
+func unsignedMapKey(keyType reflect.Type) nativeMapKeyParser[uint64] {
+	return func(_ *decodeState, raw []byte) (uint64, error) {
+		return parseUintValue(b2s(raw), keyType, false)
+	}
+}
+
+func decodeNativeMap[K comparable, V any](t reflect.Type, elem *typeDecoder, parseKey nativeMapKeyParser[K]) decodeFunc {
 	return func(d *decodeState, p unsafe.Pointer) error {
 		if d.buf[d.pos] != '{' {
 			return newSemanticError(t, "expected object")
@@ -1522,10 +1657,11 @@ func decodeNativeMap[V any](t reflect.Type, elem *typeDecoder) decodeFunc {
 		if err := d.enter(); err != nil {
 			return err
 		}
-		m := *(*map[string]V)(p)
-		if m == nil {
-			m = make(map[string]V)
-			*(*map[string]V)(p) = m
+		m := *(*map[K]V)(p)
+		fresh := m == nil
+		if fresh {
+			m = make(map[K]V)
+			*(*map[K]V)(p) = m
 		}
 		if err := d.nextValueStart(); err != nil {
 			return err
@@ -1537,12 +1673,21 @@ func decodeNativeMap[V any](t reflect.Type, elem *typeDecoder) decodeFunc {
 		}
 		value := new(V)
 		var zero V
-		for {
+		for decoded := 0; ; decoded++ {
+			if fresh && decoded == presizeAfterEntries {
+				if rest := d.objectSizeHint(); rest > 0 {
+					m = resizedMap(m, decoded+rest)
+					*(*map[K]V)(p) = m
+				}
+			}
 			key, err := d.objectKey()
 			if err != nil {
 				return err
 			}
-			name := d.ownString(key)
+			name, err := parseKey(d, key)
+			if err != nil {
+				return err
+			}
 			*value = zero
 			if err := d.value(elem, unsafe.Pointer(value)); err != nil {
 				return err

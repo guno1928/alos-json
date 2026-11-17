@@ -32,7 +32,9 @@ func guardCorpus() []string {
 
 func exerciseScanEntryPoints(b []byte) {
 	Valid(b)
+	ValidLax(b)
 	validFast(b)
+	validFastLax(b)
 	validScalar(b)
 	exerciseIndexedValid(b)
 	SkipSpace(b, 0)

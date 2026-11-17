@@ -13,6 +13,7 @@ const (
 	levelWordBits      = 64
 	inlineStringWords  = 4
 	containerWordShift = 6
+	blankedStringByte  = 'a'
 )
 
 type deepStack [MaxDepth/levelWordBits + 1]uint64
@@ -259,6 +260,32 @@ exponent:
 		i = digitRunEnd(p, n, i+1)
 	}
 	goto afterValue
+}
+
+func validFastLax(b []byte) bool {
+	return validFast(b) || validFast(blankStringContents(b))
+}
+
+func blankStringContents(b []byte) []byte {
+	out := make([]byte, len(b))
+	inString := false
+	for i := 0; i < len(b); i++ {
+		c := b[i]
+		switch {
+		case !inString:
+			out[i] = c
+			inString = c == '"'
+		case c == '"':
+			out[i] = c
+			inString = false
+		case c == '\\' && i+1 < len(b):
+			out[i], out[i+1] = blankedStringByte, blankedStringByte
+			i++
+		default:
+			out[i] = blankedStringByte
+		}
+	}
+	return out
 }
 
 func skipStringBody(b []byte, i int) (int, bool) {

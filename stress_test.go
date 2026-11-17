@@ -11,6 +11,7 @@ import (
 	"time"
 
 	alosjson "github.com/guno1928/alos-json"
+	"github.com/guno1928/alos-json/jsontext"
 )
 
 const (
@@ -22,12 +23,13 @@ const (
 )
 
 type stressCase struct {
-	doc     []byte
-	valid   bool
-	decoded any
-	encoded []byte
-	record  guardRecordPortable
-	recOK   bool
+	doc       []byte
+	valid     bool
+	decodable bool
+	decoded   any
+	encoded   []byte
+	record    guardRecordPortable
+	recOK     bool
 }
 
 type guardRecordPortable struct {
@@ -55,8 +57,8 @@ func buildStressCases(t *testing.T) []stressCase {
 	}
 	cases := make([]stressCase, 0, len(docs))
 	for _, d := range docs {
-		c := stressCase{doc: []byte(d), valid: alosjson.Valid([]byte(d))}
-		if c.valid {
+		c := stressCase{doc: []byte(d), valid: alosjson.Valid([]byte(d)), decodable: jsontext.Value(d).IsValid()}
+		if c.decodable {
 			if err := alosjson.Unmarshal(c.doc, &c.decoded); err != nil {
 				t.Fatalf("Unmarshal(%q): %v", d, err)
 			}
@@ -91,7 +93,7 @@ func TestConcurrentResultsAreIndependent(t *testing.T) {
 					errs <- fmt.Errorf("Valid changed for %q", c.doc)
 					return
 				}
-				if !c.valid {
+				if !c.decodable {
 					continue
 				}
 				var got any

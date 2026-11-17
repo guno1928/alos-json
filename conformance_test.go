@@ -42,9 +42,9 @@ func TestJSONTestSuite(t *testing.T) {
 		}
 		kind := name[:2]
 		counts[kind]++
-		valid := alosjson.Valid(data)
-		if jsontext.Value(data).IsValid() != valid {
-			t.Errorf("%s: IsValid disagrees with Valid", name)
+		valid := jsontext.Value(data).IsValid()
+		if alosjson.Valid(data) != stdjson.Valid(blankStringContents(data)) {
+			t.Errorf("%s: Valid disagrees with encoding/json on the document with string contents blanked", name)
 		}
 		var got any
 		decodeErr := unmarshalNoPanic(t, name, data, &got)

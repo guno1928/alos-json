@@ -117,6 +117,35 @@ func TestDecimalLen(t *testing.T) {
 	}
 }
 
+const smallUintExhaustiveLimit = 1_000_000
+
+func TestAppendUint64SmallExhaustive(t *testing.T) {
+	buf := []byte("x")
+	for v := range uint64(smallUintExhaustiveLimit) {
+		buf = AppendUint64(buf[:1], v)
+		if string(buf[1:]) != strconv.FormatUint(v, 10) || buf[0] != 'x' {
+			t.Fatalf("AppendUint64(%d) = %q", v, buf)
+		}
+	}
+}
+
+const (
+	midUintStride = 37
+	midUintLimit  = 100_000_000
+)
+
+func TestAppendUint64EightDigitRange(t *testing.T) {
+	buf := []byte("x")
+	for v := uint64(smallUintExhaustiveLimit); v < midUintLimit; v += midUintStride {
+		for _, w := range []uint64{v, v - 1, v + 1} {
+			buf = AppendUint64(buf[:1], w)
+			if string(buf[1:]) != strconv.FormatUint(w, 10) || buf[0] != 'x' {
+				t.Fatalf("AppendUint64(%d) = %q", w, buf)
+			}
+		}
+	}
+}
+
 const intRandomSamples = 10_000_000
 
 func TestAppendIntRandomMatchesStrconv(t *testing.T) {

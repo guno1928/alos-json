@@ -6,6 +6,8 @@ import (
 	"github.com/guno1928/alos-json/jsontext"
 )
 
+const RuntimeMapHooks = runtimeMapHooks
+
 func UnmarshalReference(data []byte, v any, opts ...Option) error {
 	rv := reflect.ValueOf(v)
 	if rv.Kind() != reflect.Pointer || rv.IsNil() {

@@ -21,3 +21,10 @@ func Valid(b []byte) bool {
 	}
 	return validFast(b)
 }
+
+func ValidLax(b []byte) bool {
+	if useValidKernel && len(b) >= indexedValidMinLen && len(b) <= math.MaxInt32 {
+		return validAdaptiveLax(b)
+	}
+	return validFastLax(b)
+}

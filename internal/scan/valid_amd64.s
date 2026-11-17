@@ -99,6 +99,9 @@ block:
 	ORQ   blockState_hexCarry(BX), AX
 	JNZ   load
 
+	CMPB  blockState_lax(BX), $0
+	JNE   laxStringRun
+
 stringRun:
 	VMOVDQU   (SI), Y0
 	VMOVDQU   32(SI), Y1
@@ -125,6 +128,8 @@ stringRun:
 load:
 	VMOVDQU (SI), Y0
 	VMOVDQU 32(SI), Y1
+	CMPB    blockState_lax(BX), $0
+	JNE     laxClassify
 
 classify:
 	VPMINUB   Y10, Y0, Y7
@@ -179,6 +184,8 @@ escapes:
 	XORQ  R13, R9
 	ANDQ  DX, R9
 	ANDNQ R8, R9, R8
+	CMPB  blockState_lax(BX), $0
+	JNE   laxStrings
 
 	VMOVDQU strNibble<>(SB), Y2
 	VMOVDQU strClassLo<>(SB), Y4
@@ -245,11 +252,7 @@ flatten:
 	FLATTEN_ONE(4)
 	FLATTEN_ONE(8)
 	FLATTEN_ONE(12)
-	FLATTEN_ONE(16)
-	FLATTEN_ONE(20)
-	FLATTEN_ONE(24)
-	FLATTEN_ONE(28)
-	ADDQ  $32, DI
+	ADDQ  $16, DI
 	TESTQ R10, R10
 	JNZ   flatten
 	LEAQ  (AX)(R12*4), DI
@@ -257,6 +260,116 @@ flatten:
 advance:
 	ADDQ $64, SI
 	JMP  block
+
+laxStringRun:
+	VMOVDQU  (SI), Y0
+	VMOVDQU  32(SI), Y1
+	VPCMPEQB Y15, Y0, Y2
+	VPCMPEQB Y14, Y0, Y3
+	VPCMPEQB Y15, Y1, Y5
+	VPCMPEQB Y14, Y1, Y6
+	VPOR     Y2, Y3, Y2
+	VPOR     Y5, Y6, Y5
+	VPOR     Y2, Y5, Y2
+	VPTEST   Y2, Y2
+	JNZ      laxClassify
+	ADDQ     $64, SI
+	CMPQ     SI, CX
+	JB       laxStringRun
+	JMP      exit
+
+laxStrings:
+	TESTQ R8, R8
+	JNZ   strings
+	CMPQ  blockState_inStrMask(BX), $0
+	JGE   strings
+	MOVQ  $-1, blockState_inStrMask(BX)
+	MOVQ  blockState_escCarry(BX), R12
+
+laxInString:
+	ADDQ      $64, SI
+	CMPQ      SI, CX
+	JAE       laxInStringDone
+	VMOVDQU   (SI), Y0
+	VMOVDQU   32(SI), Y1
+	VPCMPEQB  Y15, Y0, Y2
+	VPCMPEQB  Y15, Y1, Y3
+	VPCMPEQB  Y14, Y0, Y4
+	VPCMPEQB  Y14, Y1, Y5
+	VPMOVMSKB Y2, R8
+	VPMOVMSKB Y3, DX
+	SHLQ      $32, DX
+	ORQ       DX, R8
+	VPMOVMSKB Y4, R9
+	VPMOVMSKB Y5, DX
+	SHLQ      $32, DX
+	ORQ       DX, R9
+	MOVQ      R12, R13
+	MOVQ      R12, AX
+	ORQ       R9, AX
+	JZ        laxInQuotes
+	MOVQ      R12, AX
+	ANDNQ     R9, AX, R9
+	LEAQ      (AX)(R9*2), DX
+	ANDNQ     R9, DX, AX
+	MOVQ      $0xAAAAAAAAAAAAAAAA, R10
+	ANDQ      R10, AX
+	ADDQ      AX, R9
+	SBBQ      R12, R12
+	NEGQ      R12
+	ADDQ      R9, R9
+	MOVQ      $0x5555555555555555, R10
+	XORQ      R10, R9
+	ANDQ      DX, R9
+	ANDNQ     R8, R9, R8
+
+laxInQuotes:
+	TESTQ R8, R8
+	JZ    laxInString
+	MOVQ  DI, R11
+
+laxCloseQuote:
+	TZCNTQ  R8, DX
+	CMPQ    DX, $60
+	JA      laxBail
+	MOVWLZX 1(SI)(DX*1), AX
+	CMPL    AX, $0x222C
+	JNE     laxBail
+	CMPQ    DI, R14
+	JA      laxBail
+	MOVQ    SI, R10
+	SUBQ    p+0(FP), R10
+	ADDQ    blockState_pos(BX), R10
+	LEAQ    1(R10)(DX*1), R10
+	MOVL    R10, (DI)
+	INCL    R10
+	MOVL    R10, 4(DI)
+	ADDQ    $8, DI
+	LEAL    3(DX), R10
+	MOVQ    $-1, AX
+	SHLXQ   R10, AX, AX
+	ANDQ    AX, R8
+	JNZ     laxCloseQuote
+	JMP     laxInString
+
+laxBail:
+	MOVQ R11, DI
+	MOVQ R13, blockState_escCarry(BX)
+	JMP  load
+
+laxInStringDone:
+	MOVQ R12, blockState_escCarry(BX)
+	JMP  exit
+
+laxClassify:
+	QUOTE_MASKS(Y0)
+	VPMOVMSKB Y2, R8
+	VPMOVMSKB Y3, R9
+	QUOTE_MASKS(Y1)
+	MERGE_HIGH(Y2, R8)
+	MERGE_HIGH(Y3, R9)
+	XORL      R12, R12
+	JMP       quotes
 
 exit:
 	SUBQ p+0(FP), SI

@@ -150,6 +150,10 @@ func nilSafe(fn encodeFunc) encodeFunc {
 func makeMethodOrKindEncodeFunc(t reflect.Type, b *encoderBuilder) encodeFunc {
 	pt := reflect.PointerTo(t)
 	switch {
+	case t == timeType:
+		return encodeTime
+	case t == timePtrType:
+		return encodeTimePointer
 	case t.Implements(marshalerToType) || pt.Implements(marshalerToType):
 		return encodeMarshalerTo(t)
 	case t.Implements(marshalerType) || pt.Implements(marshalerType):
@@ -507,11 +511,14 @@ func encodeFloat64(_ *encodeState, b []byte, p unsafe.Pointer) ([]byte, error) {
 }
 
 func encodeString(e *encodeState, b []byte, p unsafe.Pointer) ([]byte, error) {
-	s := *(*string)(p)
+	return e.appendStringValue(b, *(*string)(p)), nil
+}
+
+func (e *encodeState) appendStringValue(b []byte, s string) []byte {
 	if len(s) >= handoffStringLen {
-		return e.appendLargeString(b, s), nil
+		return e.appendLargeString(b, s)
 	}
-	return e.appendString(b, s), nil
+	return e.appendString(b, s)
 }
 
 func encodeBytes(_ *encodeState, b []byte, p unsafe.Pointer) ([]byte, error) {
@@ -793,6 +800,9 @@ func encodeMap(t reflect.Type, b *encoderBuilder) encodeFunc {
 			})
 		}
 	}
+	if fn := linkedMapEncoder(t, b); fn != nil {
+		return fn
+	}
 	return encodeReflectMap(t, b)
 }
 
@@ -1047,6 +1057,34 @@ type fieldEncoder struct {
 	conditional bool
 	zeroCheck   omitCheck
 	emptyCheck  omitCheck
+	inline      inlineScalar
+}
+
+type inlineScalar uint8
+
+const (
+	inlineNone inlineScalar = iota
+	inlineString
+	inlineBool
+	inlineInt
+	inlineInt64
+)
+
+func inlineScalarFor(t reflect.Type, b *encoderBuilder) inlineScalar {
+	if !b.nativeOK() || hasCustomMarshaler(t) {
+		return inlineNone
+	}
+	switch t.Kind() {
+	case reflect.String:
+		return inlineString
+	case reflect.Bool:
+		return inlineBool
+	case reflect.Int:
+		return inlineInt
+	case reflect.Int64:
+		return inlineInt64
+	}
+	return inlineNone
 }
 
 type omitCheck uint8
@@ -1134,6 +1172,7 @@ func encodeStruct(t reflect.Type, b *encoderBuilder) encodeFunc {
 			conditional:   !sf.direct || sf.omitZero || sf.omitEmpty || omitZeroFields,
 			zeroCheck:     zeroCheckFor(sf.typ),
 			emptyCheck:    emptyCheckFor(sf.typ),
+			inline:        inlineScalarFor(sf.typ, b),
 		}
 		fields[i].setPrefix("," + fields[i].key)
 		if !sf.direct || sf.omitZero || sf.omitEmpty || sf.asString {
@@ -1194,8 +1233,21 @@ func encodeStruct(t reflect.Type, b *encoderBuilder) encodeFunc {
 		var err error
 		for i := range fields {
 			f := &fields[i]
-			if b, err = f.te.fn(e, f.appendPrefix(b), unsafe.Add(p, f.offset)); err != nil {
-				return b, err
+			b = f.appendPrefix(b)
+			fp := unsafe.Add(p, f.offset)
+			switch f.inline {
+			case inlineString:
+				b = e.appendStringValue(b, *(*string)(fp))
+			case inlineBool:
+				b = appendBool(b, *(*bool)(fp))
+			case inlineInt:
+				b = e.appendInt(b, int64(*(*int)(fp)))
+			case inlineInt64:
+				b = e.appendInt(b, *(*int64)(fp))
+			default:
+				if b, err = f.te.fn(e, b, fp); err != nil {
+					return b, err
+				}
 			}
 		}
 		return append(b, '}'), nil

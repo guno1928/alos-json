@@ -4,6 +4,7 @@ import (
 	"io"
 	"reflect"
 
+	"github.com/guno1928/alos-json/internal/scan"
 	"github.com/guno1928/alos-json/jsontext"
 )
 
@@ -37,9 +38,9 @@ func UnmarshalRead(r io.Reader, v any, opts ...Option) error {
 	return err
 }
 
-// Valid reports whether data is valid JSON.
+// Valid reports whether data is structurally valid JSON. String contents are not inspected.
 func Valid(data []byte) bool {
-	return jsontext.Value(data).IsValid()
+	return scan.ValidLax(data)
 }
 
 // Compact appends to dst the JSON-encoded src with insignificant space removed.

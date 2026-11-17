@@ -39,6 +39,16 @@ func checkIndexed(t testing.TB, b []byte) {
 	if got := Valid(b); got != want {
 		t.Fatalf("Valid (len %d) %q = %v, encoding/json.Valid = %v", len(b), b, got, want)
 	}
+	wantLax := laxSpec(b)
+	if got := validIndexedMode(b, true); got != wantLax {
+		t.Fatalf("validIndexed lax (len %d) %q = %v, spec = %v", len(b), b, got, wantLax)
+	}
+	if got := validAdaptiveLax(b); got != wantLax {
+		t.Fatalf("validAdaptive lax (len %d) %q = %v, spec = %v", len(b), b, got, wantLax)
+	}
+	if got := ValidLax(b); got != wantLax {
+		t.Fatalf("ValidLax (len %d) %q = %v, spec = %v", len(b), b, got, wantLax)
+	}
 }
 
 var indexedOffsets = func() []int {
@@ -259,10 +269,13 @@ func TestValidKernelFallbackMatches(t *testing.T) {
 	defer func() { useValidKernel = saved }()
 	for _, doc := range indexedCorpus() {
 		useValidKernel = false
-		off := Valid(doc)
+		off, offLax := Valid(doc), ValidLax(doc)
 		useValidKernel = saved
 		if on, want := Valid(doc), json.Valid(doc); off != want || on != want {
 			t.Fatalf("Valid(%q): kernel %v, fallback %v, encoding/json %v", doc, on, off, want)
+		}
+		if on, want := ValidLax(doc), laxSpec(doc); offLax != want || on != want {
+			t.Fatalf("ValidLax(%q): kernel %v, fallback %v, spec %v", doc, on, offLax, want)
 		}
 	}
 }

@@ -43,7 +43,9 @@ func DecimalLen(v uint64) int {
 }
 
 const (
+	threeDigitsMod = 1_000
 	fourDigitsMod  = 10_000
+	sixDigitsMod   = 1_000_000
 	div100Mul      = 5243
 	div100Shift    = 19
 	div100LaneMask = 0x0000007F0000007F
@@ -99,6 +101,27 @@ func AppendUint64(dst []byte, v uint64) []byte {
 	if v < pairBase {
 		pair := digitPair16[v]
 		return append(dst, byte(pair), byte(pair>>digitByteShift))
+	}
+	if v < threeDigitsMod {
+		q := v / pairBase
+		low := digitPair16[v-q*pairBase]
+		return append(dst, byte('0'+q), byte(low), byte(low>>digitByteShift))
+	}
+	if v < fourDigitsMod {
+		q := v / pairBase
+		high, low := digitPair16[q], digitPair16[v-q*pairBase]
+		return append(dst, byte(high), byte(high>>digitByteShift), byte(low), byte(low>>digitByteShift))
+	}
+	if v < sixDigitsMod {
+		top := v / fourDigitsMod
+		rest := v - top*fourDigitsMod
+		q := rest / pairBase
+		mid, low := digitPair16[q], digitPair16[rest-q*pairBase]
+		if top < 10 {
+			return append(dst, byte('0'+top), byte(mid), byte(mid>>digitByteShift), byte(low), byte(low>>digitByteShift))
+		}
+		head := digitPair16[top]
+		return append(dst, byte(head), byte(head>>digitByteShift), byte(mid), byte(mid>>digitByteShift), byte(low), byte(low>>digitByteShift))
 	}
 	k := DecimalLen(v)
 	start := len(dst)

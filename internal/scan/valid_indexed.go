@@ -25,6 +25,7 @@ type blockState struct {
 	escCarry    uint64
 	hexCarry    uint64
 	scalarCarry uint64
+	lax         bool
 }
 
 var blankBlock = func() (blk [BlockLen]byte) {
@@ -86,16 +87,31 @@ func (s *tokenStream) scalarEnds(i int) bool {
 	return i >= len(s.b) || scalarTerminator[byteAt(s.src, i)]
 }
 
-func validAdaptive(b []byte) bool {
+func denseSample(b []byte) bool {
 	sample := b[:min(len(b), densitySampleLen)]
-	if (bytes.Count(sample, commaByte)+bytes.Count(sample, colonByte))*sparseBytesPerSeparator > len(sample) {
+	return (bytes.Count(sample, commaByte)+bytes.Count(sample, colonByte))*sparseBytesPerSeparator > len(sample)
+}
+
+func validAdaptive(b []byte) bool {
+	if denseSample(b) {
 		return validFast(b)
 	}
 	return validIndexed(b)
 }
 
+func validAdaptiveLax(b []byte) bool {
+	if denseSample(b) && validFast(b) {
+		return true
+	}
+	return validIndexedMode(b, true)
+}
+
 func validIndexed(b []byte) bool {
-	s := tokenStream{b: b, src: unsafe.Pointer(unsafe.SliceData(b))}
+	return validIndexedMode(b, false)
+}
+
+func validIndexedMode(b []byte, lax bool) bool {
+	s := tokenStream{b: b, src: unsafe.Pointer(unsafe.SliceData(b)), st: blockState{lax: lax}}
 	s.idx[0] = batchEnd
 	var deep *deepStack
 	ok := s.run(&deep)

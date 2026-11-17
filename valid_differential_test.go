@@ -11,14 +11,60 @@ import (
 
 const stdMaxDepth = 10000
 
+const kernelPadding = 4096
+
+func blankStringContents(b []byte) []byte {
+	out := make([]byte, len(b))
+	inString := false
+	for i := 0; i < len(b); i++ {
+		c := b[i]
+		switch {
+		case !inString:
+			out[i] = c
+			inString = c == '"'
+		case c == '"':
+			out[i] = c
+			inString = false
+		case c == '\\' && i+1 < len(b):
+			out[i], out[i+1] = 'a', 'a'
+			i++
+		default:
+			out[i] = 'a'
+		}
+	}
+	return out
+}
+
+func checkLaxValid(t *testing.T, b []byte) {
+	t.Helper()
+	want := stdjson.Valid(blankStringContents(b))
+	if got := alosjson.Valid(b); got != want {
+		t.Fatalf("Valid(%q) = %v, encoding/json with string contents blanked = %v", b, got, want)
+	}
+}
+
 func checkValidAgainstStd(t *testing.T, b []byte) {
 	t.Helper()
-	want := stdjson.Valid(b)
-	if got := alosjson.Valid(b); got != want {
-		t.Fatalf("Valid(%q) = %v, encoding/json = %v", b, got, want)
-	}
-	if got := jsontext.Value(b).IsValid(); got != want {
+	if got, want := jsontext.Value(b).IsValid(), stdjson.Valid(b); got != want {
 		t.Fatalf("Value(%q).IsValid() = %v, encoding/json = %v", b, got, want)
+	}
+	checkLaxValid(t, b)
+	checkLaxValid(t, append([]byte(strings.Repeat(" ", kernelPadding)), b...))
+}
+
+func TestValidSkipsStringContents(t *testing.T) {
+	for _, s := range []string{`"\x"`, `"\u12g4"`, `"\u12"`, "\"a\x01\"", `"\'"`, `{"\q":"\uZZZZ"}`, "[\"\t\",\"\x00\"]", `"\\"`, `"\""`} {
+		if !alosjson.Valid([]byte(s)) {
+			t.Errorf("Valid(%q) = false, want true", s)
+		}
+		if jsontext.Value(s).IsValid() != stdjson.Valid([]byte(s)) {
+			t.Errorf("Value(%q).IsValid() disagrees with encoding/json", s)
+		}
+	}
+	for _, s := range []string{`"\"`, `"abc`, `"\`, `["\"]`, `{"a\":1}`, `"a"x`, `"\x" 1`} {
+		if alosjson.Valid([]byte(s)) {
+			t.Errorf("Valid(%q) = true, want false", s)
+		}
 	}
 }
 
